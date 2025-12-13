@@ -27,6 +27,19 @@ const UPLOADS_DIR = path.join(__dirname, "uploads");
 
 fs.ensureDirSync(UPLOADS_DIR);
 
+// ---------------- APP ----------------
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use("/uploads", express.static(UPLOADS_DIR));
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+  filename: (req, file, cb) =>
+    cb(null, uuidv4() + path.extname(file.originalname)),
+});
+const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
+
 // ---------------- MONGO CLIENT ----------------
 const client = new MongoClient(MONGO_URI);
 let db, Users, Contests, Registrations, Submissions;
@@ -51,25 +64,10 @@ async function connectDB() {
   }
 }
 
-connectDB();
-
 process.on("SIGINT", async () => {
   await client.close();
   process.exit(0);
 });
-
-// ---------------- APP ----------------
-const app = express();
-app.use(cors());
-app.use(express.json());
-app.use("/uploads", express.static(UPLOADS_DIR));
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
-  filename: (req, file, cb) =>
-    cb(null, uuidv4() + path.extname(file.originalname)),
-});
-const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
 
 // ---------------- HELPERS ----------------
 function signToken(user) {
@@ -106,7 +104,7 @@ function requireRole(...roles) {
   };
 }
 
-// ---------------- AUTH ----------------
+// ---------------- AUTH ROUTES ----------------
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { name, email, password, role } = req.body;
@@ -168,15 +166,24 @@ app.post("/api/auth/login", async (req, res) => {
 });
 
 app.post("/api/auth/google", async (req, res) => {
+  console.log("📍 Google auth endpoint HIT!");
   const { idToken } = req.body;
-  if (!idToken) return res.status(400).json({ error: "Missing idToken" });
+
+  if (!idToken) {
+    console.log("❌ No idToken");
+    return res.status(400).json({ error: "Missing idToken" });
+  }
 
   try {
+    console.log("🔍 Verifying token...");
     const decodedToken = await admin.auth().verifyIdToken(idToken);
     const { uid, email, name, picture } = decodedToken;
+    console.log("✅ Verified:", email);
 
     let user = await Users.findOne({ email: email.toLowerCase() });
+
     if (!user) {
+      console.log("👤 Creating user...");
       const userDoc = {
         name: name || email.split("@")[0],
         email: email.toLowerCase(),
@@ -194,6 +201,8 @@ app.post("/api/auth/google", async (req, res) => {
     }
 
     const token = signToken(user);
+    console.log("✅ Sending response");
+
     res.json({
       user: {
         id: user._id.toString(),
@@ -206,7 +215,7 @@ app.post("/api/auth/google", async (req, res) => {
       token,
     });
   } catch (err) {
-    console.error(err);
+    console.error("❌ Error:", err.message);
     res.status(401).json({ error: "Invalid Firebase token" });
   }
 });
@@ -254,7 +263,6 @@ app.put("/api/users/me", authMiddleware, async (req, res) => {
       { _id: new ObjectId(req.user._id) },
       { $set: updates }
     );
-
     const user = await Users.findOne(
       { _id: new ObjectId(req.user._id) },
       { projection: { password: 0 } }
@@ -277,21 +285,19 @@ app.post(
         description,
         image,
         type,
-        taskInstruction,
         prizeMoney,
         deadline,
         entryFee,
         participantsLimit,
         tags,
       } = req.body;
-
       if (!name || !description || !deadline)
         return res.status(400).json({ error: "Required fields missing" });
 
       const contest = {
         name,
         description,
-        image: image,
+        image: image || "https://via.placeholder.com/400x300",
         type: type || "general",
         prizeMoney: parseInt(prizeMoney) || 0,
         deadline: new Date(deadline),
@@ -330,7 +336,6 @@ app.get("/api/contests", async (req, res) => {
       .skip(skip)
       .limit(parseInt(limit))
       .toArray();
-
     const total = await Contests.countDocuments(filter);
     res.json({
       contests,
@@ -704,8 +709,122 @@ app.put(
   }
 );
 
+app.get(
+  "/api/admin/contests",
+  authMiddleware,
+  requireRole("admin"),
+  async (req, res) => {
+    const contests = await Contests.find({}).sort({ createdAt: -1 }).toArray();
+    res.json({ contests });
+  }
+);
+
+// ---------------- STATS ENDPOINT ----------------
+app.get("/api/stats", authMiddleware, async (req, res) => {
+  try {
+    const userId = new ObjectId(req.user._id);
+    const role = req.user.role;
+
+    let stats = {
+      activeContests: 0,
+      totalWins: 0,
+      totalWinnings: 0,
+      totalContests: 0,
+      totalParticipants: 0,
+      totalSubmissions: 0,
+      totalPrizes: 0,
+      pendingContests: 0,
+      rejectedContests: 0,
+      totalUsers: 0,
+    };
+
+    // ---------- USER ----------
+    if (role === "user") {
+      stats.activeContests = await Registrations.countDocuments({
+        user: userId,
+      });
+      stats.totalWins = req.user.wonCount || 0;
+
+      // sum winnings
+      const submissions = await Submissions.find({
+        user: userId,
+        isWinner: true,
+      }).toArray();
+
+      stats.totalWinnings = submissions.reduce(
+        (sum, s) => sum + (s.prizeMoney || 0),
+        0
+      );
+    }
+
+    // ---------- CREATOR ----------
+    if (role === "creator") {
+      stats.totalContests = await Contests.countDocuments({ creator: userId });
+
+      stats.pendingContests = await Contests.countDocuments({
+        creator: userId,
+        status: "pending",
+      });
+
+      stats.rejectedContests = await Contests.countDocuments({
+        creator: userId,
+        status: "rejected",
+      });
+
+      const createdContests = await Contests.find({
+        creator: userId,
+      }).toArray();
+
+      stats.totalParticipants = createdContests.reduce(
+        (sum, c) => sum + (c.participantsCount || 0),
+        0
+      );
+
+      stats.totalSubmissions = createdContests.reduce(
+        (sum, c) => sum + (c.submissionsCount || 0),
+        0
+      );
+
+      stats.totalPrizes = createdContests.reduce(
+        (sum, c) => sum + (c.prizeMoney || 0),
+        0
+      );
+    }
+
+    // ---------- ADMIN ----------
+    if (role === "admin") {
+      stats.totalUsers = await Users.countDocuments();
+      stats.totalContests = await Contests.countDocuments();
+
+      stats.totalParticipants = await Registrations.countDocuments();
+      stats.totalSubmissions = await Submissions.countDocuments();
+
+      const allContests = await Contests.find({}).toArray();
+      stats.totalPrizes = allContests.reduce(
+        (sum, c) => sum + (c.prizeMoney || 0),
+        0
+      );
+    }
+
+    res.json(stats);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to load stats" });
+  }
+});
+
 // ---------------- HEALTH ----------------
 app.get("/", (req, res) => res.send("✅ ContestHub API running"));
 app.get("/health", (req, res) => res.json({ ok: true, timestamp: new Date() }));
 
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+// Start server
+connectDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`\n🚀 Server running on http://localhost:${PORT}`);
+    console.log(`📡 API: http://localhost:${PORT}/api`);
+    console.log(`\n✅ Routes registered:`);
+    console.log(`   POST /api/auth/register`);
+    console.log(`   POST /api/auth/login`);
+    console.log(`   POST /api/auth/google`);
+    console.log(`   GET  /api/auth/me`);
+  });
+});
