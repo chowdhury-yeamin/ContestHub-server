@@ -24,7 +24,6 @@ const MONGO_URI = process.env.MONGO_URI;
 const DB_NAME = process.env.DB_NAME || "contesthub";
 const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret";
 const UPLOADS_DIR = path.join(__dirname, "uploads");
-
 fs.ensureDirSync(UPLOADS_DIR);
 
 // ---------------- APP ----------------
@@ -166,24 +165,15 @@ app.post("/api/auth/login", async (req, res) => {
 });
 
 app.post("/api/auth/google", async (req, res) => {
-  console.log("📍 Google auth endpoint HIT!");
   const { idToken } = req.body;
-
-  if (!idToken) {
-    console.log("❌ No idToken");
-    return res.status(400).json({ error: "Missing idToken" });
-  }
+  if (!idToken) return res.status(400).json({ error: "Missing idToken" });
 
   try {
-    console.log("🔍 Verifying token...");
     const decodedToken = await admin.auth().verifyIdToken(idToken);
     const { uid, email, name, picture } = decodedToken;
-    console.log("✅ Verified:", email);
 
     let user = await Users.findOne({ email: email.toLowerCase() });
-
     if (!user) {
-      console.log("👤 Creating user...");
       const userDoc = {
         name: name || email.split("@")[0],
         email: email.toLowerCase(),
@@ -201,8 +191,6 @@ app.post("/api/auth/google", async (req, res) => {
     }
 
     const token = signToken(user);
-    console.log("✅ Sending response");
-
     res.json({
       user: {
         id: user._id.toString(),
@@ -215,7 +203,6 @@ app.post("/api/auth/google", async (req, res) => {
       token,
     });
   } catch (err) {
-    console.error("❌ Error:", err.message);
     res.status(401).json({ error: "Invalid Firebase token" });
   }
 });
@@ -268,12 +255,13 @@ app.put("/api/users/me", authMiddleware, async (req, res) => {
       { projection: { password: 0 } }
     );
     res.json({ user });
-  } catch (error) {
+  } catch {
     res.status(500).json({ error: "Server error" });
   }
 });
 
 // ---------------- CONTESTS ----------------
+
 app.post(
   "/api/contests",
   authMiddleware,
@@ -290,33 +278,79 @@ app.post(
         entryFee,
         participantsLimit,
         tags,
+        taskInstruction,
       } = req.body;
-      if (!name || !description || !deadline)
+
+      if (!name || !description || !deadline) {
         return res.status(400).json({ error: "Required fields missing" });
+      }
+
+      const slug =
+        name
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "") +
+        "-" +
+        Date.now();
+
+      const creatorId =
+        req.user._id instanceof ObjectId
+          ? req.user._id
+          : new ObjectId(req.user._id);
 
       const contest = {
         name,
+        slug,
         description,
         image: image || "https://via.placeholder.com/400x300",
         type: type || "general",
-        prizeMoney: parseInt(prizeMoney) || 0,
+        contestType: type || "general",
+        prizeMoney: Number(prizeMoney) || 0,
         deadline: new Date(deadline),
-        entryFee: parseInt(entryFee) || 0,
-        participantsLimit: parseInt(participantsLimit) || null,
-        tags: tags || [],
-        creator: new ObjectId(req.user._id),
+        entryFee: Number(entryFee) || 0,
+        participantsLimit: participantsLimit ? Number(participantsLimit) : null,
+        tags: Array.isArray(tags) ? tags : [],
+        taskInstruction: taskInstruction || "",
+        creator: creatorId,
         creatorName: req.user.name,
+        creatorEmail: req.user.email,
         status: "pending",
         participantsCount: 0,
         submissionsCount: 0,
         winner: null,
         createdAt: new Date(),
+        updatedAt: new Date(),
       };
 
       const result = await Contests.insertOne(contest);
-      res.json({ contest: await Contests.findOne({ _id: result.insertedId }) });
+      const createdContest = await Contests.findOne({ _id: result.insertedId });
+
+      res.status(201).json({
+        success: true,
+        contest: createdContest,
+      });
     } catch (err) {
-      res.status(500).json({ error: "Server error" });
+      console.error("❌ Contest creation error:", err.message);
+      res.status(500).json({
+        error: err.message,
+        details: "Failed to create contest",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/contests/creator/my-contests",
+  authMiddleware,
+  requireRole("creator"),
+  async (req, res) => {
+    try {
+      const contests = await Contests.find({ creator: req.user._id })
+        .sort({ createdAt: -1 })
+        .toArray();
+      res.json({ contests });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch contests" });
     }
   }
 );
@@ -349,93 +383,30 @@ app.get("/api/contests", async (req, res) => {
 });
 
 app.get("/api/contests/:id", async (req, res) => {
-  if (!ObjectId.isValid(req.params.id))
-    return res.status(400).json({ error: "Invalid id" });
-  const contest = await Contests.findOne({ _id: new ObjectId(req.params.id) });
-  if (!contest) return res.status(404).json({ error: "Contest not found" });
-  res.json({ contest });
-});
+  try {
+    const { id } = req.params;
 
-app.put("/api/contests/:id", authMiddleware, async (req, res) => {
-  if (!ObjectId.isValid(req.params.id))
-    return res.status(400).json({ error: "Invalid id" });
-  const contest = await Contests.findOne({ _id: new ObjectId(req.params.id) });
-  if (!contest) return res.status(404).json({ error: "Contest not found" });
-  if (
-    req.user.role !== "admin" &&
-    contest.creator.toString() !== req.user._id.toString()
-  )
-    return res.status(403).json({ error: "Forbidden" });
+    console.log("📍 Fetching contest with ID:", id);
 
-  const updates = {};
-  [
-    "name",
-    "description",
-    "image",
-    "type",
-    "prizeMoney",
-    "deadline",
-    "entryFee",
-    "participantsLimit",
-    "tags",
-  ].forEach((k) => {
-    if (req.body[k] !== undefined) {
-      if (k === "deadline") updates[k] = new Date(req.body[k]);
-      else if (["prizeMoney", "entryFee", "participantsLimit"].includes(k))
-        updates[k] = parseInt(req.body[k]);
-      else updates[k] = req.body[k];
+    if (!ObjectId.isValid(id)) {
+      console.log("❌ Invalid ObjectId format");
+      return res.status(400).json({ error: "Invalid contest ID" });
     }
-  });
-  updates.updatedAt = new Date();
 
-  await Contests.updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $set: updates }
-  );
-  res.json({
-    contest: await Contests.findOne({ _id: new ObjectId(req.params.id) }),
-  });
-});
+    const contest = await Contests.findOne({ _id: new ObjectId(id) });
 
-app.delete("/api/contests/:id", authMiddleware, async (req, res) => {
-  if (!ObjectId.isValid(req.params.id))
-    return res.status(400).json({ error: "Invalid id" });
-  const contest = await Contests.findOne({ _id: new ObjectId(req.params.id) });
-  if (!contest) return res.status(404).json({ error: "Contest not found" });
-  if (
-    req.user.role !== "admin" &&
-    contest.creator.toString() !== req.user._id.toString()
-  )
-    return res.status(403).json({ error: "Forbidden" });
-
-  await Contests.deleteOne({ _id: new ObjectId(req.params.id) });
-  await Registrations.deleteMany({ contest: new ObjectId(req.params.id) });
-  const subs = await Submissions.find({
-    contest: new ObjectId(req.params.id),
-  }).toArray();
-  for (const s of subs)
-    if (s.filePath) await fs.remove(path.join(UPLOADS_DIR, s.filePath));
-  await Submissions.deleteMany({ contest: new ObjectId(req.params.id) });
-  res.json({ success: true });
-});
-
-app.get(
-  "/api/contests/creator/my-contests",
-  authMiddleware,
-  requireRole("creator"),
-  async (req, res) => {
-    try {
-      const contests = await Contests.find({
-        creator: new ObjectId(req.user._id),
-      })
-        .sort({ createdAt: -1 })
-        .toArray();
-      res.json({ contests });
-    } catch (err) {
-      res.status(500).json({ error: "Server error" });
+    if (!contest) {
+      console.log("❌ Contest not found");
+      return res.status(404).json({ error: "Contest not found" });
     }
+
+    console.log("✅ Contest found:", contest.name);
+    res.json({ contest });
+  } catch (error) {
+    console.error("❌ Error fetching contest:", error);
+    res.status(500).json({ error: "Server error" });
   }
-);
+});
 
 // ---------------- REGISTRATIONS ----------------
 app.post("/api/contests/:id/register", authMiddleware, async (req, res) => {
@@ -562,11 +533,13 @@ app.post(
 
 app.get("/api/contests/:id/submissions", authMiddleware, async (req, res) => {
   const { id } = req.params;
+
   if (!ObjectId.isValid(id))
     return res.status(400).json({ error: "Invalid id" });
 
   const contest = await Contests.findOne({ _id: new ObjectId(id) });
   if (!contest) return res.status(404).json({ error: "Contest not found" });
+
   if (
     req.user.role !== "admin" &&
     contest.creator.toString() !== req.user._id.toString()
@@ -594,8 +567,75 @@ app.get("/api/contests/:id/submissions", authMiddleware, async (req, res) => {
       },
     },
   ]).toArray();
+
   res.json({ submissions });
 });
+
+// ---------------- GET ALL SUBMISSIONS FOR CREATOR ----------------
+app.get(
+  "/api/creator/all-submissions",
+  authMiddleware,
+  requireRole("creator"),
+  async (req, res) => {
+    try {
+      const creatorContests = await Contests.find({
+        creator: new ObjectId(req.user._id),
+      }).toArray();
+
+      const contestIds = creatorContests.map((c) => c._id);
+
+      if (contestIds.length === 0) {
+        return res.json({ submissions: [] });
+      }
+
+      const submissions = await Submissions.aggregate([
+        { $match: { contest: { $in: contestIds } } },
+        {
+          $lookup: {
+            from: "users",
+            localField: "user",
+            foreignField: "_id",
+            as: "participant",
+          },
+        },
+        { $unwind: "$participant" },
+        {
+          $lookup: {
+            from: "contests",
+            localField: "contest",
+            foreignField: "_id",
+            as: "contestInfo",
+          },
+        },
+        { $unwind: "$contestInfo" },
+        {
+          $project: {
+            _id: 1,
+            submission: 1,
+            submittedAt: 1,
+            isWinner: 1,
+            contest: "$contestInfo._id",
+            contestName: "$contestInfo.name",
+            contestDeadline: "$contestInfo.deadline",
+            contestPrizeMoney: "$contestInfo.prizeMoney",
+            participant: {
+              _id: 1,
+              name: 1,
+              email: 1,
+              photoURL: 1,
+            },
+          },
+        },
+        { $sort: { submittedAt: -1 } },
+      ]).toArray();
+
+      res.json({ submissions });
+    } catch (error) {
+      console.error("❌ Error fetching all submissions:", error);
+      res.status(500).json({ error: "Failed to fetch submissions" });
+    }
+  }
+);
 
 app.post("/api/submissions/:id/winner", authMiddleware, async (req, res) => {
   const { id } = req.params;
@@ -663,6 +703,73 @@ app.get("/api/winners", async (req, res) => {
   res.json({ winners });
 });
 
+// ---------------- LEADERBOARD ----------------
+app.get("/api/leaderboard", async (req, res) => {
+  try {
+    const leaderboard = await Users.aggregate([
+      {
+        $match: {
+          wonCount: { $gt: 0 },
+        },
+      },
+      {
+        $lookup: {
+          from: "submissions",
+          let: { userId: "$_id" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ["$user", "$$userId"] },
+                    { $eq: ["$isWinner", true] },
+                  ],
+                },
+              },
+            },
+            {
+              $lookup: {
+                from: "contests",
+                localField: "contest",
+                foreignField: "_id",
+                as: "contestInfo",
+              },
+            },
+            { $unwind: "$contestInfo" },
+            {
+              $group: {
+                _id: null,
+                totalPrizes: { $sum: "$contestInfo.prizeMoney" },
+              },
+            },
+          ],
+          as: "winnings",
+        },
+      },
+      {
+        $project: {
+          _id: 1,
+          name: 1,
+          email: 1,
+          photoURL: 1,
+          wins: "$wonCount",
+          totalPrizes: {
+            $ifNull: [{ $arrayElemAt: ["$winnings.totalPrizes", 0] }, 0],
+          },
+        },
+      },
+      {
+        $sort: { wins: -1, totalPrizes: -1 },
+      },
+    ]).toArray();
+
+    res.json({ leaderboard });
+  } catch (error) {
+    console.error("❌ Error fetching leaderboard:", error);
+    res.status(500).json({ error: "Failed to fetch leaderboard" });
+  }
+});
+
 // ---------------- ADMIN ----------------
 app.get(
   "/api/admin/users",
@@ -719,7 +826,7 @@ app.get(
   }
 );
 
-// ---------------- STATS ENDPOINT ----------------
+// ---------------- STATS ----------------
 app.get("/api/stats", authMiddleware, async (req, res) => {
   try {
     const userId = new ObjectId(req.user._id);
@@ -738,67 +845,53 @@ app.get("/api/stats", authMiddleware, async (req, res) => {
       totalUsers: 0,
     };
 
-    // ---------- USER ----------
     if (role === "user") {
       stats.activeContests = await Registrations.countDocuments({
         user: userId,
       });
       stats.totalWins = req.user.wonCount || 0;
-
-      // sum winnings
       const submissions = await Submissions.find({
         user: userId,
         isWinner: true,
       }).toArray();
-
       stats.totalWinnings = submissions.reduce(
         (sum, s) => sum + (s.prizeMoney || 0),
         0
       );
     }
 
-    // ---------- CREATOR ----------
     if (role === "creator") {
       stats.totalContests = await Contests.countDocuments({ creator: userId });
-
       stats.pendingContests = await Contests.countDocuments({
         creator: userId,
         status: "pending",
       });
-
       stats.rejectedContests = await Contests.countDocuments({
         creator: userId,
         status: "rejected",
       });
-
       const createdContests = await Contests.find({
         creator: userId,
       }).toArray();
-
       stats.totalParticipants = createdContests.reduce(
         (sum, c) => sum + (c.participantsCount || 0),
         0
       );
-
       stats.totalSubmissions = createdContests.reduce(
         (sum, c) => sum + (c.submissionsCount || 0),
         0
       );
-
       stats.totalPrizes = createdContests.reduce(
         (sum, c) => sum + (c.prizeMoney || 0),
         0
       );
     }
 
-    // ---------- ADMIN ----------
     if (role === "admin") {
       stats.totalUsers = await Users.countDocuments();
       stats.totalContests = await Contests.countDocuments();
-
       stats.totalParticipants = await Registrations.countDocuments();
       stats.totalSubmissions = await Submissions.countDocuments();
-
       const allContests = await Contests.find({}).toArray();
       stats.totalPrizes = allContests.reduce(
         (sum, c) => sum + (c.prizeMoney || 0),
@@ -807,7 +900,7 @@ app.get("/api/stats", authMiddleware, async (req, res) => {
     }
 
     res.json(stats);
-  } catch (error) {
+  } catch {
     res.status(500).json({ error: "Failed to load stats" });
   }
 });
@@ -818,13 +911,7 @@ app.get("/health", (req, res) => res.json({ ok: true, timestamp: new Date() }));
 
 // Start server
 connectDB().then(() => {
-  app.listen(PORT, () => {
-    console.log(`\n🚀 Server running on http://localhost:${PORT}`);
-    console.log(`📡 API: http://localhost:${PORT}/api`);
-    console.log(`\n✅ Routes registered:`);
-    console.log(`   POST /api/auth/register`);
-    console.log(`   POST /api/auth/login`);
-    console.log(`   POST /api/auth/google`);
-    console.log(`   GET  /api/auth/me`);
-  });
+  app.listen(PORT, () =>
+    console.log(`🚀 Server running on http://localhost:${PORT}`)
+  );
 });
