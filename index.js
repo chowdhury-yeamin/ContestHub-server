@@ -339,6 +339,137 @@ app.post(
   }
 );
 
+// ---------------- UPDATE CONTEST ----------------
+app.put("/api/contests/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid contest ID" });
+    }
+
+    const contest = await Contests.findOne({ _id: new ObjectId(id) });
+
+    if (!contest) {
+      return res.status(404).json({ error: "Contest not found" });
+    }
+
+    if (
+      req.user.role !== "admin" &&
+      contest.creator.toString() !== req.user._id.toString()
+    ) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const {
+      name,
+      description,
+      image,
+      type,
+      prizeMoney,
+      deadline,
+      entryFee,
+      participantsLimit,
+      tags,
+      taskInstruction,
+    } = req.body;
+
+    const updates = {};
+    if (name) updates.name = name;
+    if (description) updates.description = description;
+    if (image) updates.image = image;
+    if (type) {
+      updates.type = type;
+      updates.contestType = type;
+    }
+    if (prizeMoney !== undefined) updates.prizeMoney = Number(prizeMoney);
+    if (deadline) updates.deadline = new Date(deadline);
+    if (entryFee !== undefined) updates.entryFee = Number(entryFee);
+    if (participantsLimit !== undefined) {
+      updates.participantsLimit = participantsLimit
+        ? Number(participantsLimit)
+        : null;
+    }
+    if (tags) updates.tags = Array.isArray(tags) ? tags : [];
+    if (taskInstruction !== undefined)
+      updates.taskInstruction = taskInstruction;
+    updates.updatedAt = new Date();
+
+    await Contests.updateOne({ _id: new ObjectId(id) }, { $set: updates });
+
+    const updatedContest = await Contests.findOne({ _id: new ObjectId(id) });
+    res.json({ success: true, contest: updatedContest });
+  } catch (error) {
+    console.error("❌ Error updating contest:", error);
+    res.status(500).json({ error: "Failed to update contest" });
+  }
+});
+
+// ---------------- DELETE CONTEST ----------------
+app.delete("/api/contests/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    console.log("📍 DELETE request for contest ID:", id);
+
+    if (!ObjectId.isValid(id)) {
+      console.log("❌ Invalid ObjectId format");
+      return res.status(400).json({ error: "Invalid contest ID" });
+    }
+
+    const contest = await Contests.findOne({ _id: new ObjectId(id) });
+
+    if (!contest) {
+      console.log("❌ Contest not found");
+      return res.status(404).json({ error: "Contest not found" });
+    }
+
+    if (
+      req.user.role !== "admin" &&
+      contest.creator.toString() !== req.user._id.toString()
+    ) {
+      console.log("❌ Unauthorized delete attempt");
+      return res
+        .status(403)
+        .json({ error: "Forbidden - You can only delete your own contests" });
+    }
+
+    if (contest.status !== "pending" && req.user.role !== "admin") {
+      return res.status(400).json({
+        error: "Cannot delete confirmed or rejected contests",
+      });
+    }
+
+    console.log("✅ Deleting contest:", contest.name);
+
+    await Registrations.deleteMany({ contest: new ObjectId(id) });
+
+    const submissions = await Submissions.find({
+      contest: new ObjectId(id),
+    }).toArray();
+    for (const submission of submissions) {
+      if (submission.filePath) {
+        const filePath = path.join(UPLOADS_DIR, submission.filePath);
+        try {
+          await fs.remove(filePath);
+          console.log("🗑️ Deleted file:", submission.filePath);
+        } catch (err) {
+          console.error("⚠️ Error deleting file:", err.message);
+        }
+      }
+    }
+    await Submissions.deleteMany({ contest: new ObjectId(id) });
+
+    await Contests.deleteOne({ _id: new ObjectId(id) });
+
+    console.log("✅ Contest deleted successfully");
+    res.json({ success: true, message: "Contest deleted successfully" });
+  } catch (error) {
+    console.error("❌ Error deleting contest:", error);
+    res.status(500).json({ error: "Failed to delete contest" });
+  }
+});
+
 app.get(
   "/api/contests/creator/my-contests",
   authMiddleware,
@@ -407,6 +538,130 @@ app.get("/api/contests/:id", async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+
+//------------------ Payment -----------------------
+app.get("/api/creator-requests/my-status", authMiddleware, async (req, res) => {
+  try {
+    const request = await db.collection("creator_requests").findOne(
+      {
+        userId: new ObjectId(req.user._id),
+      },
+      { sort: { createdAt: -1 } }
+    );
+    res.json({ request });
+  } catch (error) {
+    console.error("❌ Error fetching request status:", error);
+    res.status(500).json({ error: "Failed to fetch status" });
+  }
+});
+
+app.post("/api/creator-requests", authMiddleware, async (req, res) => {
+  try {
+    if (req.user.role === "creator" || req.user.role === "admin") {
+      return res.status(400).json({ error: "You are already a creator" });
+    }
+
+    const existingRequest = await db.collection("creator_requests").findOne({
+      userId: new ObjectId(req.user._id),
+      status: "pending",
+    });
+
+    if (existingRequest) {
+      return res
+        .status(400)
+        .json({ error: "You already have a pending request" });
+    }
+
+    const request = {
+      userId: new ObjectId(req.user._id),
+      userName: req.user.name,
+      userEmail: req.user.email,
+      userPhoto: req.user.photoURL,
+      status: "pending",
+      createdAt: new Date(),
+    };
+
+    const result = await db.collection("creator_requests").insertOne(request);
+    res.json({
+      success: true,
+      message: "Creator request submitted successfully",
+      request: { ...request, _id: result.insertedId },
+    });
+  } catch (error) {
+    console.error("❌ Error creating creator request:", error);
+    res.status(500).json({ error: "Failed to submit request" });
+  }
+});
+
+app.get(
+  "/api/admin/creator-requests",
+  authMiddleware,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const requests = await db
+        .collection("creator_requests")
+        .find({})
+        .sort({ createdAt: -1 })
+        .toArray();
+      res.json({ requests });
+    } catch (error) {
+      console.error("❌ Error fetching creator requests:", error);
+      res.status(500).json({ error: "Failed to fetch requests" });
+    }
+  }
+);
+
+app.put(
+  "/api/admin/creator-requests/:id",
+  authMiddleware,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { status } = req.body;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ error: "Invalid request ID" });
+      }
+
+      if (!["approved", "rejected"].includes(status)) {
+        return res.status(400).json({ error: "Invalid status" });
+      }
+
+      const request = await db
+        .collection("creator_requests")
+        .findOne({ _id: new ObjectId(id) });
+
+      if (!request) {
+        return res.status(404).json({ error: "Request not found" });
+      }
+
+      await db.collection("creator_requests").updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            status,
+            processedAt: new Date(),
+            processedBy: req.user._id,
+          },
+        }
+      );
+
+      if (status === "approved") {
+        await Users.updateOne(
+          { _id: request.userId },
+          { $set: { role: "creator" } }
+        );
+      }
+
+      res.json({ success: true, message: `Request ${status} successfully` });
+    } catch (error) {
+      console.error("❌ Error processing creator request:", error);
+      res.status(500).json({ error: "Failed to process request" });
+    }
+  }
+);
 
 // ---------------- REGISTRATIONS ----------------
 app.post("/api/contests/:id/register", authMiddleware, async (req, res) => {
