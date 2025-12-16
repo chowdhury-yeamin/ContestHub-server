@@ -49,7 +49,7 @@ const PORT = process.env.PORT || 5000;
 const MONGO_URI = process.env.MONGO_URI;
 const DB_NAME = process.env.DB_NAME || "contesthub";
 const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret";
-// No local uploads
+
 
 // App
 const app = express();
