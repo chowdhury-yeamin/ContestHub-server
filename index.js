@@ -10,6 +10,31 @@ const path = require("path");
 const { randomUUID } = require("crypto");
 const admin = require("firebase-admin");
 
+// CORS Configuration
+const corsOptions = {
+  origin: function (origin, callback) {
+    const allowedOrigins = [
+      "http://localhost:5173",
+      "http://localhost:3000",
+      "https://contest-hub-the-best-contest-website.netlify.app",
+      process.env.CLIENT_URL,
+    ];
+
+    // Allow requests with no origin
+    if (!origin) return callback(null, true);
+
+    if (allowedOrigins.indexOf(origin) !== -1 || !origin) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
+  credentials: true,
+  optionsSuccessStatus: 200,
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+};
+
 // Firebase admin init
 let bucket = null;
 try {
@@ -52,13 +77,23 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret";
 
 // App
 const app = express();
-// CORS and security
-const allowedOrigin = process.env.SITE_DOMAIN || process.env.VITE_API_URL || "*";
-const corsOptions =
-  allowedOrigin && allowedOrigin !== "*"
-    ? { origin: allowedOrigin, credentials: true, allowedHeaders: ["Content-Type", "Authorization"] }
-    : { origin: true, allowedHeaders: ["Content-Type", "Authorization"] };
-app.use(cors(corsOptions));
+const prodOrigin = process.env.SITE_DOMAIN || process.env.VITE_API_URL || null;
+const devOrigin = process.env.DEV_ORIGIN || "http://localhost:5173";
+const allowedOrigins = [prodOrigin, devOrigin].filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // allow non-browser requests (e.g., server-to-server, curl)
+      if (!origin) return cb(null, true);
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+      return cb(new Error("CORS not allowed"), false);
+    },
+    credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  })
+);
 app.use(express.json({ limit: "10mb" }));
 
 // Basic security headers
@@ -75,7 +110,7 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
 });
-const stripe = require("stripe")(process.env.STRIPE_SECRET);
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
 // Mongo client
 const client = new MongoClient(MONGO_URI);
@@ -627,7 +662,7 @@ app.post("/api/create-checkout-session", async (req, res) => {
   }
 });
 
-app.patch("/payment-success", async (req, res) => {
+app.patch("/api/payment-success", async (req, res) => {
   try {
     const sessionId = req.query.session_id;
     console.log("📍 /payment-success called with sessionId:", sessionId);
@@ -748,8 +783,6 @@ app.patch("/payment-success", async (req, res) => {
     res.status(400).json({ error: err.message });
   }
 });
-
-// Stripe webhook
 
 app.post(
   "/webhook",
@@ -1550,5 +1583,7 @@ connectDB().then(() => {
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err && (err.stack || err.message || err));
   if (res.headersSent) return next(err);
-  res.status(err && err.status ? err.status : 500).json({ error: "Server error" });
+  res
+    .status(err && err.status ? err.status : 500)
+    .json({ error: "Server error" });
 });
