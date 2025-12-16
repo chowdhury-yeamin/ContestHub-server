@@ -50,11 +50,25 @@ const MONGO_URI = process.env.MONGO_URI;
 const DB_NAME = process.env.DB_NAME || "contesthub";
 const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret";
 
-
 // App
 const app = express();
-app.use(cors());
-app.use(express.json());
+// CORS and security
+const allowedOrigin = process.env.SITE_DOMAIN || process.env.VITE_API_URL || "*";
+const corsOptions =
+  allowedOrigin && allowedOrigin !== "*"
+    ? { origin: allowedOrigin, credentials: true, allowedHeaders: ["Content-Type", "Authorization"] }
+    : { origin: true, allowedHeaders: ["Content-Type", "Authorization"] };
+app.use(cors(corsOptions));
+app.use(express.json({ limit: "10mb" }));
+
+// Basic security headers
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-XSS-Protection", "1; mode=block");
+  next();
+});
 
 // Multer memory storage
 const upload = multer({
@@ -1530,4 +1544,11 @@ connectDB().then(() => {
   app.listen(PORT, () =>
     console.log(`🚀 Server running on http://localhost:${PORT}`)
   );
+});
+
+// Central error handler
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err && (err.stack || err.message || err));
+  if (res.headersSent) return next(err);
+  res.status(err && err.status ? err.status : 500).json({ error: "Server error" });
 });
