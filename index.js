@@ -10,7 +10,7 @@ const path = require("path");
 const { randomUUID } = require("crypto");
 const admin = require("firebase-admin");
 
-// Initialize Firebase Admin (support FB_SERVICE_KEY base64 or GOOGLE_APPLICATION_CREDENTIALS)
+// Firebase admin init
 let bucket = null;
 try {
   if (process.env.FB_SERVICE_KEY) {
@@ -37,33 +37,33 @@ try {
   try {
     bucket = admin.storage().bucket(process.env.FB_STORAGE_BUCKET);
   } catch (err) {
-    // bucket may be undefined if storage not configured; handle later
+    // Bucket may be undefined
     console.warn("⚠️ Firebase Storage bucket not available:", err.message);
   }
 } catch (error) {
   console.error("❌ Firebase Admin error:", error.message);
 }
 
-// ---------------- CONFIG ----------------
+// Config
 const PORT = process.env.PORT || 5000;
 const MONGO_URI = process.env.MONGO_URI;
 const DB_NAME = process.env.DB_NAME || "contesthub";
 const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret";
-// No local uploads directory on serverless deployments; use Firebase Storage instead
+// No local uploads
 
-// ---------------- APP ----------------
+// App
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Use memory storage for multer and upload buffers to Firebase Storage
+// Multer memory storage
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
 });
 const stripe = require("stripe")(process.env.STRIPE_SECRET);
 
-// ---------------- MONGO CLIENT ----------------
+// Mongo client
 const client = new MongoClient(MONGO_URI);
 let db, Users, Contests, Registrations, Submissions;
 
@@ -92,7 +92,7 @@ process.on("SIGINT", async () => {
   process.exit(0);
 });
 
-// ---------------- HELPERS ----------------
+// Helpers
 function signToken(user) {
   return jwt.sign(
     { id: user._id.toString(), role: user.role, email: user.email },
@@ -127,7 +127,7 @@ function requireRole(...roles) {
   };
 }
 
-// ---------------- AUTH ROUTES ----------------
+// Auth routes
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { name, email, password, role } = req.body;
@@ -284,7 +284,7 @@ app.put("/api/users/me", authMiddleware, async (req, res) => {
   }
 });
 
-// ---------------- CONTESTS ----------------
+// Contests
 app.post(
   "/api/contests",
   authMiddleware,
@@ -362,7 +362,7 @@ app.post(
   }
 );
 
-// ---------------- UPDATE CONTEST ----------------
+// Update contest
 app.put("/api/contests/:id", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
@@ -428,7 +428,7 @@ app.put("/api/contests/:id", authMiddleware, async (req, res) => {
   }
 });
 
-// ---------------- DELETE CONTEST ----------------
+// Delete contest
 app.delete("/api/contests/:id", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
@@ -565,7 +565,7 @@ app.get("/api/contests/:id", async (req, res) => {
   }
 });
 
-//------------------ Payment -----------------------
+// Payment
 app.post("/api/create-checkout-session", async (req, res) => {
   try {
     const { contestName, contestId, cost, senderEmail, senderId } = req.body;
@@ -580,7 +580,7 @@ app.post("/api/create-checkout-session", async (req, res) => {
       return res.status(400).json({ error: "Invalid amount" });
     }
 
-    // Determine base site URL: prefer configured SITE_DOMAIN, otherwise use origin header
+    // Site domain
     const siteDomain =
       process.env.SITE_DOMAIN || req.headers.origin || `http://localhost:5173`;
 
@@ -601,7 +601,7 @@ app.post("/api/create-checkout-session", async (req, res) => {
       mode: "payment",
       customer_email: senderEmail,
       metadata: { contestId, userId: senderId || "" },
-      // Include the CHECKOUT_SESSION_ID placeholder so Stripe redirects back with session_id
+      // Include session id
       success_url: `${siteDomain}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${siteDomain}/dashboard/payment-canceled`,
     });
@@ -620,7 +620,7 @@ app.patch("/payment-success", async (req, res) => {
     if (!sessionId)
       return res.status(400).json({ error: "Missing session_id" });
 
-    // Retrieve session from Stripe
+    // Retrieve Stripe session
     console.log("🔍 Retrieving Stripe session:", sessionId);
     const session = await stripe.checkout.sessions.retrieve(sessionId);
     console.log("✅ Stripe session retrieved:", {
@@ -646,7 +646,7 @@ app.patch("/payment-success", async (req, res) => {
         .json({ error: "Missing contestId or customer email in session" });
     }
 
-    // Prefer userId in metadata, fallback to email lookup. If not found, create a minimal guest user.
+    // Find user
     let user = null;
     const metaUserId =
       session.metadata?.userId || session.metadata?.user_id || "";
@@ -657,7 +657,7 @@ app.patch("/payment-success", async (req, res) => {
       user = await Users.findOne({ email: customerEmail.toLowerCase() });
     }
     if (!user && customerEmail) {
-      // Create a minimal guest user so the registration is recorded
+      // Create guest user
       const guest = {
         name:
           session.customer_details?.name ||
@@ -688,13 +688,13 @@ app.patch("/payment-success", async (req, res) => {
       });
     }
 
-    // Ensure contest exists
+    // Validate contest
     if (!ObjectId.isValid(contestId))
       return res.status(400).json({ error: "Invalid contest id" });
     const contest = await Contests.findOne({ _id: new ObjectId(contestId) });
     if (!contest) return res.status(404).json({ error: "Contest not found" });
 
-    // Prevent duplicate registration
+    // Prevent duplicates
     const existing = await Registrations.findOne({
       user: new ObjectId(user._id),
       contest: new ObjectId(contestId),
@@ -735,7 +735,7 @@ app.patch("/payment-success", async (req, res) => {
   }
 });
 
-// ---------------- STRIPE WEBHOOK ----------------
+// Stripe webhook
 
 app.post(
   "/webhook",
@@ -755,7 +755,7 @@ app.post(
       if (webhookSecret) {
         event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
       } else {
-        // Fallback: parse body as JSON (not recommended for production)
+        // Fallback JSON parse
         event = JSON.parse(req.body.toString());
       }
     } catch (err) {
@@ -763,7 +763,7 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    // Handle the checkout.session.completed event
+    // Handle checkout.completed
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
 
@@ -779,7 +779,7 @@ app.post(
       }
 
       try {
-        // Prefer userId metadata, then fallback to email lookup; create guest user if needed
+        // Find user
         let user = null;
         const metaUserId =
           session.metadata?.userId || session.metadata?.user_id || "";
@@ -877,12 +877,12 @@ app.post(
       }
     }
 
-    // Other event types can be handled here
+    // Other events
     res.status(200).json({ received: true });
   }
 );
 
-//------------------ Admin Requests -----------------------
+// Admin requests
 app.get("/api/creator-requests/my-status", authMiddleware, async (req, res) => {
   try {
     const request = await db.collection("creator_requests").findOne(
@@ -1006,7 +1006,7 @@ app.put(
   }
 );
 
-// ---------------- REGISTRATIONS ----------------
+// Registrations
 app.post("/api/contests/:id/register", authMiddleware, async (req, res) => {
   const { id } = req.params;
   if (!ObjectId.isValid(id))
@@ -1071,7 +1071,7 @@ app.get("/api/users/me/wins", authMiddleware, async (req, res) => {
   res.json({ wins: contests });
 });
 
-// ---------------- SUBMISSIONS ----------------
+// Submissions
 app.post(
   "/api/contests/:id/submit",
   authMiddleware,
@@ -1096,7 +1096,7 @@ app.post(
         return res.status(400).json({ error: "Must register first" });
       }
 
-      // Handle file upload to Firebase Storage (if provided)
+      // Upload to storage
       let filePath = null;
       let fileOriginalName = null;
       if (req.file) {
@@ -1106,11 +1106,9 @@ app.post(
           req.file.originalname
         )}`;
         try {
-          await bucket
-            .file(filename)
-            .save(req.file.buffer, {
-              metadata: { contentType: req.file.mimetype },
-            });
+          await bucket.file(filename).save(req.file.buffer, {
+            metadata: { contentType: req.file.mimetype },
+          });
           filePath = filename;
           fileOriginalName = req.file.originalname;
           console.log("✅ Uploaded file to storage:", filename);
@@ -1189,7 +1187,7 @@ app.get("/api/contests/:id/submissions", authMiddleware, async (req, res) => {
   res.json({ submissions });
 });
 
-// ---------------- GET ALL SUBMISSIONS FOR CREATOR ----------------
+// Creator submissions
 app.get(
   "/api/creator/all-submissions",
   authMiddleware,
@@ -1283,7 +1281,7 @@ app.post("/api/submissions/:id/winner", authMiddleware, async (req, res) => {
   res.json({ success: true });
 });
 
-// ---------------- WINNERS ----------------
+// Winners
 app.get("/api/winners", async (req, res) => {
   const winners = await Submissions.aggregate([
     { $match: { isWinner: true } },
@@ -1321,7 +1319,7 @@ app.get("/api/winners", async (req, res) => {
   res.json({ winners });
 });
 
-// ---------------- LEADERBOARD ----------------
+// Leaderboard
 app.get("/api/leaderboard", async (req, res) => {
   try {
     const leaderboard = await Users.aggregate([
@@ -1388,7 +1386,7 @@ app.get("/api/leaderboard", async (req, res) => {
   }
 });
 
-// ---------------- ADMIN ----------------
+// Admin
 app.get(
   "/api/admin/users",
   authMiddleware,
@@ -1444,7 +1442,7 @@ app.get(
   }
 );
 
-// ---------------- STATS ----------------
+// Stats
 app.get("/api/stats", authMiddleware, async (req, res) => {
   try {
     const userId = new ObjectId(req.user._id);
@@ -1523,7 +1521,7 @@ app.get("/api/stats", authMiddleware, async (req, res) => {
   }
 });
 
-// ---------------- HEALTH ----------------
+// Health
 app.get("/", (req, res) => res.send("✅ ContestHub API running"));
 app.get("/health", (req, res) => res.json({ ok: true, timestamp: new Date() }));
 
