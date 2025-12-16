@@ -7,13 +7,39 @@ const jwt = require("jsonwebtoken");
 const multer = require("multer");
 const fs = require("fs-extra");
 const path = require("path");
-const { v4: uuidv4, parse } = require("uuid");
+const { randomUUID } = require("crypto");
 const admin = require("firebase-admin");
 
-// Initialize Firebase Admin
+// Initialize Firebase Admin (support FB_SERVICE_KEY base64 or GOOGLE_APPLICATION_CREDENTIALS)
+let bucket = null;
 try {
-  admin.initializeApp();
-  console.log("✅ Firebase Admin initialized");
+  if (process.env.FB_SERVICE_KEY) {
+    const svc = JSON.parse(
+      Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString("utf8")
+    );
+    admin.initializeApp({
+      credential: admin.credential.cert(svc),
+      storageBucket: process.env.FB_STORAGE_BUCKET || undefined,
+    });
+    console.log("✅ Firebase Admin initialized from FB_SERVICE_KEY");
+  } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    admin.initializeApp({
+      credential: admin.credential.applicationDefault(),
+      storageBucket: process.env.FB_STORAGE_BUCKET || undefined,
+    });
+    console.log(
+      "✅ Firebase Admin initialized from GOOGLE_APPLICATION_CREDENTIALS"
+    );
+  } else {
+    admin.initializeApp();
+    console.log("✅ Firebase Admin initialized (default)");
+  }
+  try {
+    bucket = admin.storage().bucket(process.env.FB_STORAGE_BUCKET);
+  } catch (err) {
+    // bucket may be undefined if storage not configured; handle later
+    console.warn("⚠️ Firebase Storage bucket not available:", err.message);
+  }
 } catch (error) {
   console.error("❌ Firebase Admin error:", error.message);
 }
@@ -23,21 +49,18 @@ const PORT = process.env.PORT || 5000;
 const MONGO_URI = process.env.MONGO_URI;
 const DB_NAME = process.env.DB_NAME || "contesthub";
 const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret";
-const UPLOADS_DIR = path.join(__dirname, "uploads");
-fs.ensureDirSync(UPLOADS_DIR);
+// No local uploads directory on serverless deployments; use Firebase Storage instead
 
 // ---------------- APP ----------------
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.use("/uploads", express.static(UPLOADS_DIR));
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
-  filename: (req, file, cb) =>
-    cb(null, uuidv4() + path.extname(file.originalname)),
+// Use memory storage for multer and upload buffers to Firebase Storage
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
 });
-const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
 const stripe = require("stripe")(process.env.STRIPE_SECRET);
 
 // ---------------- MONGO CLIENT ----------------
@@ -448,13 +471,16 @@ app.delete("/api/contests/:id", authMiddleware, async (req, res) => {
       contest: new ObjectId(id),
     }).toArray();
     for (const submission of submissions) {
-      if (submission.filePath) {
-        const filePath = path.join(UPLOADS_DIR, submission.filePath);
+      if (submission.filePath && bucket) {
         try {
-          await fs.remove(filePath);
-          console.log("🗑️ Deleted file:", submission.filePath);
+          await bucket.file(submission.filePath).delete();
+          console.log("🗑️ Deleted storage file:", submission.filePath);
         } catch (err) {
-          console.error("⚠️ Error deleting file:", err.message);
+          console.warn(
+            "⚠️ Error deleting storage file:",
+            submission.filePath,
+            err.message
+          );
         }
       }
     }
@@ -542,7 +568,7 @@ app.get("/api/contests/:id", async (req, res) => {
 //------------------ Payment -----------------------
 app.post("/api/create-checkout-session", async (req, res) => {
   try {
-    const { contestName, contestId, cost, senderEmail } = req.body;
+    const { contestName, contestId, cost, senderEmail, senderId } = req.body;
 
     if (!contestName || !contestId || !cost || !senderEmail) {
       return res.status(400).json({ error: "Missing payment fields" });
@@ -553,6 +579,10 @@ app.post("/api/create-checkout-session", async (req, res) => {
     if (!Number.isInteger(amount) || amount <= 0) {
       return res.status(400).json({ error: "Invalid amount" });
     }
+
+    // Determine base site URL: prefer configured SITE_DOMAIN, otherwise use origin header
+    const siteDomain =
+      process.env.SITE_DOMAIN || req.headers.origin || `http://localhost:5173`;
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
@@ -570,9 +600,10 @@ app.post("/api/create-checkout-session", async (req, res) => {
       ],
       mode: "payment",
       customer_email: senderEmail,
-      metadata: { contestId },
-      success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success`,
-      cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-canceled`,
+      metadata: { contestId, userId: senderId || "" },
+      // Include the CHECKOUT_SESSION_ID placeholder so Stripe redirects back with session_id
+      success_url: `${siteDomain}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${siteDomain}/dashboard/payment-canceled`,
     });
 
     res.json({ url: session.url });
@@ -581,6 +612,275 @@ app.post("/api/create-checkout-session", async (req, res) => {
     res.status(400).json({ error: err.message });
   }
 });
+
+app.patch("/payment-success", async (req, res) => {
+  try {
+    const sessionId = req.query.session_id;
+    console.log("📍 /payment-success called with sessionId:", sessionId);
+    if (!sessionId)
+      return res.status(400).json({ error: "Missing session_id" });
+
+    // Retrieve session from Stripe
+    console.log("🔍 Retrieving Stripe session:", sessionId);
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    console.log("✅ Stripe session retrieved:", {
+      id: session.id,
+      payment_status: session.payment_status,
+    });
+    if (!session) return res.status(404).json({ error: "Session not found" });
+
+    const contestId = session.metadata?.contestId;
+    const customerEmail =
+      session.customer_email || session.customer_details?.email;
+
+    console.log(
+      "📊 Session data: contestId=",
+      contestId,
+      "email=",
+      customerEmail
+    );
+
+    if (!contestId || !customerEmail) {
+      return res
+        .status(400)
+        .json({ error: "Missing contestId or customer email in session" });
+    }
+
+    // Prefer userId in metadata, fallback to email lookup. If not found, create a minimal guest user.
+    let user = null;
+    const metaUserId =
+      session.metadata?.userId || session.metadata?.user_id || "";
+    if (metaUserId && ObjectId.isValid(metaUserId)) {
+      user = await Users.findOne({ _id: new ObjectId(metaUserId) });
+    }
+    if (!user && customerEmail) {
+      user = await Users.findOne({ email: customerEmail.toLowerCase() });
+    }
+    if (!user && customerEmail) {
+      // Create a minimal guest user so the registration is recorded
+      const guest = {
+        name:
+          session.customer_details?.name ||
+          session.customer_details?.email?.split("@")[0] ||
+          "Guest",
+        email: customerEmail.toLowerCase(),
+        photoURL: session.customer_details?.name
+          ? `https://ui-avatars.com/api/?name=${encodeURIComponent(
+              session.customer_details.name
+            )}`
+          : "https://via.placeholder.com/48",
+        role: "user",
+        createdAt: new Date(),
+      };
+      const r = await Users.insertOne(guest);
+      guest._id = r.insertedId;
+      user = guest;
+      console.log("ℹ️ Created guest user for payment email", customerEmail);
+    }
+    if (!user) {
+      console.warn(
+        "⚠️ Payment succeeded but user not found and email missing:",
+        customerEmail
+      );
+      return res.json({
+        success: true,
+        warning: "User not found or created for session",
+      });
+    }
+
+    // Ensure contest exists
+    if (!ObjectId.isValid(contestId))
+      return res.status(400).json({ error: "Invalid contest id" });
+    const contest = await Contests.findOne({ _id: new ObjectId(contestId) });
+    if (!contest) return res.status(404).json({ error: "Contest not found" });
+
+    // Prevent duplicate registration
+    const existing = await Registrations.findOne({
+      user: new ObjectId(user._id),
+      contest: new ObjectId(contestId),
+    });
+    if (existing) {
+      return res.json({ success: true, message: "Already registered" });
+    }
+
+    const reg = {
+      user: new ObjectId(user._id),
+      contest: new ObjectId(contestId),
+      paymentStatus: "completed",
+      submissionStatus: "pending",
+      registeredAt: new Date(),
+      stripeSessionId: sessionId,
+    };
+
+    await Registrations.insertOne(reg);
+    console.log("✅ Registration inserted:", reg._id);
+
+    await Contests.updateOne(
+      { _id: new ObjectId(contestId) },
+      { $inc: { participantsCount: 1 } }
+    );
+    console.log("✅ Contest count updated");
+
+    await Users.updateOne(
+      { _id: new ObjectId(user._id) },
+      { $inc: { participatedCount: 1 } }
+    );
+    console.log("✅ User count updated");
+
+    console.log("✅ Payment success complete for user", user.email);
+    return res.json({ success: true, registration: reg });
+  } catch (err) {
+    console.error("❌ Stripe error:", err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ---------------- STRIPE WEBHOOK ----------------
+
+app.post(
+  "/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    if (!webhookSecret) {
+      console.warn(
+        "⚠️ STRIPE_WEBHOOK_SECRET not set - webhook signature won't be verified"
+      );
+    }
+
+    let event;
+    try {
+      if (webhookSecret) {
+        event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+      } else {
+        // Fallback: parse body as JSON (not recommended for production)
+        event = JSON.parse(req.body.toString());
+      }
+    } catch (err) {
+      console.error("❌ Webhook signature verification failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Handle the checkout.session.completed event
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+
+      const contestId = session.metadata?.contestId;
+      const customerEmail =
+        session.customer_email || session.customer_details?.email;
+
+      if (!contestId) {
+        console.warn("Webhook session missing contestId", session.id);
+        return res
+          .status(200)
+          .json({ received: true, warning: "missing contestId" });
+      }
+
+      try {
+        // Prefer userId metadata, then fallback to email lookup; create guest user if needed
+        let user = null;
+        const metaUserId =
+          session.metadata?.userId || session.metadata?.user_id || "";
+        if (metaUserId && ObjectId.isValid(metaUserId)) {
+          user = await Users.findOne({ _id: new ObjectId(metaUserId) });
+        }
+        if (!user && customerEmail) {
+          user = await Users.findOne({ email: customerEmail.toLowerCase() });
+        }
+        if (!user && customerEmail) {
+          const guest = {
+            name:
+              session.customer_details?.name ||
+              session.customer_details?.email?.split("@")[0] ||
+              "Guest",
+            email: customerEmail.toLowerCase(),
+            photoURL: session.customer_details?.name
+              ? `https://ui-avatars.com/api/?name=${encodeURIComponent(
+                  session.customer_details.name
+                )}`
+              : "https://via.placeholder.com/48",
+            role: "user",
+            createdAt: new Date(),
+          };
+          const r = await Users.insertOne(guest);
+          guest._id = r.insertedId;
+          user = guest;
+          console.log("ℹ️ Webhook: created guest user for", customerEmail);
+        }
+
+        if (!user) {
+          console.warn(
+            "⚠️ Webhook: user not found and no customer email",
+            session.id
+          );
+          return res
+            .status(200)
+            .json({ received: true, warning: "user not found" });
+        }
+
+        if (!ObjectId.isValid(contestId)) {
+          console.warn("⚠️ Webhook: invalid contest id", contestId);
+          return res
+            .status(200)
+            .json({ received: true, warning: "invalid contest id" });
+        }
+
+        const contest = await Contests.findOne({
+          _id: new ObjectId(contestId),
+        });
+        if (!contest) {
+          console.warn("⚠️ Webhook: contest not found", contestId);
+          return res
+            .status(200)
+            .json({ received: true, warning: "contest not found" });
+        }
+
+        // Prevent duplicates
+        const existing = await Registrations.findOne({
+          user: new ObjectId(user._id),
+          contest: new ObjectId(contestId),
+        });
+        if (existing) {
+          return res
+            .status(200)
+            .json({ received: true, message: "already registered" });
+        }
+
+        const reg = {
+          user: new ObjectId(user._id),
+          contest: new ObjectId(contestId),
+          paymentStatus: "completed",
+          submissionStatus: "pending",
+          registeredAt: new Date(),
+          stripeSessionId: session.id,
+        };
+
+        await Registrations.insertOne(reg);
+        await Contests.updateOne(
+          { _id: new ObjectId(contestId) },
+          { $inc: { participantsCount: 1 } }
+        );
+        await Users.updateOne(
+          { _id: new ObjectId(user._id) },
+          { $inc: { participatedCount: 1 } }
+        );
+
+        console.log(
+          `✅ Webhook: registered user ${user.email} for contest ${contest.name}`
+        );
+        return res.status(200).json({ received: true });
+      } catch (err) {
+        console.error("❌ Webhook processing error:", err);
+        return res.status(500).json({ error: "Webhook processing failed" });
+      }
+    }
+
+    // Other event types can be handled here
+    res.status(200).json({ received: true });
+  }
+);
 
 //------------------ Admin Requests -----------------------
 app.get("/api/creator-requests/my-status", authMiddleware, async (req, res) => {
@@ -779,14 +1079,12 @@ app.post(
   async (req, res) => {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
-      if (req.file) await fs.remove(req.file.path);
       return res.status(400).json({ error: "Invalid id" });
     }
 
     try {
       const contest = await Contests.findOne({ _id: new ObjectId(id) });
       if (!contest) {
-        if (req.file) await fs.remove(req.file.path);
         return res.status(404).json({ error: "Contest not found" });
       }
 
@@ -795,17 +1093,40 @@ app.post(
         contest: new ObjectId(id),
       });
       if (!registration) {
-        if (req.file) await fs.remove(req.file.path);
         return res.status(400).json({ error: "Must register first" });
+      }
+
+      // Handle file upload to Firebase Storage (if provided)
+      let filePath = null;
+      let fileOriginalName = null;
+      if (req.file) {
+        if (!bucket)
+          return res.status(500).json({ error: "Storage not configured" });
+        const filename = `uploads/${randomUUID()}${path.extname(
+          req.file.originalname
+        )}`;
+        try {
+          await bucket
+            .file(filename)
+            .save(req.file.buffer, {
+              metadata: { contentType: req.file.mimetype },
+            });
+          filePath = filename;
+          fileOriginalName = req.file.originalname;
+          console.log("✅ Uploaded file to storage:", filename);
+        } catch (err) {
+          console.error("❌ Storage upload failed:", err.message);
+          return res.status(500).json({ error: "Failed to upload file" });
+        }
       }
 
       const submission = {
         contest: new ObjectId(id),
         user: new ObjectId(req.user._id),
         userName: req.user.name,
-        submission: req.body.submission || req.file?.filename || "",
-        filePath: req.file ? req.file.filename : null,
-        fileOriginalName: req.file ? req.file.originalname : null,
+        submission: req.body.submission || (filePath ? filePath : ""),
+        filePath: filePath,
+        fileOriginalName: fileOriginalName,
         submittedAt: new Date(),
         isWinner: false,
       };
@@ -823,7 +1144,6 @@ app.post(
         submission: await Submissions.findOne({ _id: result.insertedId }),
       });
     } catch (error) {
-      if (req.file) await fs.remove(req.file.path);
       res.status(500).json({ error: "Server error" });
     }
   }
