@@ -96,6 +96,19 @@ app.use(
 );
 app.use(express.json({ limit: "10mb" }));
 
+app.use(
+  cors({
+    origin: [
+      "https://contest-hub-the-best-contest-website.netlify.app",
+      "http://localhost:5173",
+      "http://localhost:3000",
+    ],
+    credentials: true,
+    methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
 // Basic security headers
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -1567,6 +1580,8 @@ app.get("/api/stats", authMiddleware, async (req, res) => {
     res.status(500).json({ error: "Failed to load stats" });
   }
 });
+
+app.options("*", cors());
 
 // Health
 app.get("/", (req, res) => res.send("✅ ContestHub API running"));
