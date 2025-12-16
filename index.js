@@ -7,7 +7,7 @@ const jwt = require("jsonwebtoken");
 const multer = require("multer");
 const fs = require("fs-extra");
 const path = require("path");
-const { v4: uuidv4 } = require("uuid");
+const { v4: uuidv4, parse } = require("uuid");
 const admin = require("firebase-admin");
 
 // Initialize Firebase Admin
@@ -38,6 +38,7 @@ const storage = multer.diskStorage({
     cb(null, uuidv4() + path.extname(file.originalname)),
 });
 const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
+const stripe = require("stripe")(process.env.STRIPE_SECRET);
 
 // ---------------- MONGO CLIENT ----------------
 const client = new MongoClient(MONGO_URI);
@@ -261,7 +262,6 @@ app.put("/api/users/me", authMiddleware, async (req, res) => {
 });
 
 // ---------------- CONTESTS ----------------
-
 app.post(
   "/api/contests",
   authMiddleware,
@@ -540,6 +540,49 @@ app.get("/api/contests/:id", async (req, res) => {
 });
 
 //------------------ Payment -----------------------
+app.post("/api/create-checkout-session", async (req, res) => {
+  try {
+    const { contestName, contestId, cost, senderEmail } = req.body;
+
+    if (!contestName || !contestId || !cost || !senderEmail) {
+      return res.status(400).json({ error: "Missing payment fields" });
+    }
+
+    const amount = Number(cost) * 100;
+
+    if (!Number.isInteger(amount) || amount <= 0) {
+      return res.status(400).json({ error: "Invalid amount" });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            unit_amount: amount,
+            product_data: {
+              name: contestName,
+            },
+          },
+          quantity: 1,
+        },
+      ],
+      mode: "payment",
+      customer_email: senderEmail,
+      metadata: { contestId },
+      success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success`,
+      cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-canceled`,
+    });
+
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error("❌ Stripe error:", err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+//------------------ Admin Requests -----------------------
 app.get("/api/creator-requests/my-status", authMiddleware, async (req, res) => {
   try {
     const request = await db.collection("creator_requests").findOne(
