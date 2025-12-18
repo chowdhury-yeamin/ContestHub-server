@@ -4,36 +4,48 @@ require("dotenv").config();
 const { MongoClient, ObjectId } = require("mongodb");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const multer = require("multer");
-const fs = require("fs-extra");
-const path = require("path");
-const { randomUUID } = require("crypto");
 const admin = require("firebase-admin");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const fs = require("fs-extra");
+const path = require("path");
+const multer = require("multer");
 
 // ==================== CONFIGURATION ====================
 const PORT = process.env.PORT || 5000;
 const MONGO_URI = process.env.MONGO_URI;
 const DB_NAME = process.env.DB_NAME || "contesthub";
-const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret";
-const UPLOADS_DIR = path.join(__dirname, "uploads");
-
-// Ensure uploads directory exists
+if (!process.env.JWT_SECRET) throw new Error("JWT_SECRET is required");
+const UPLOADS_DIR = path.join("/tmp", "uploads");
 fs.ensureDirSync(UPLOADS_DIR);
+
+// Multer setup
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+  filename: (req, file, cb) =>
+    `${Date.now()}-${file.originalname.replace(/\s+/g, "_")}`,
+});
+const upload = multer({ storage });
+
 // ==================== FIREBASE ADMIN ====================
 try {
+  let serviceAccount;
   if (process.env.FB_SERVICE_KEY) {
-    const svc = JSON.parse(
+    serviceAccount = JSON.parse(
       Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString("utf8")
     );
-    admin.initializeApp({
-      credential: admin.credential.cert(svc),
-    });
+    if (!admin.apps.length) {
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+      });
+    }
     console.log("✅ Firebase Admin initialized from FB_SERVICE_KEY");
   } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-    admin.initializeApp({
-      credential: admin.credential.applicationDefault(),
-    });
+    serviceAccount = require(process.env.GOOGLE_APPLICATION_CREDENTIALS);
+    if (!admin.apps.length) {
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+      });
+    }
     console.log(
       "✅ Firebase Admin initialized from GOOGLE_APPLICATION_CREDENTIALS"
     );
@@ -64,12 +76,8 @@ app.use(
   cors({
     origin: (origin, callback) => {
       if (!origin) return callback(null, true);
-
-      if (allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error("Not allowed by CORS"));
-      }
+      if (allowedOrigins.includes(origin)) callback(null, true);
+      else callback(new Error("Not allowed by CORS"));
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -78,22 +86,6 @@ app.use(
     maxAge: 86400,
   })
 );
-
-app.use("/uploads", express.static(UPLOADS_DIR));
-
-// ==================== MULTER LOCAL STORAGE ====================
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
-  filename: (req, file, cb) => {
-    const uniqueName = `${randomUUID()}${path.extname(file.originalname)}`;
-    cb(null, uniqueName);
-  },
-});
-
-const upload = multer({
-  storage: storage,
-  limits: { fileSize: 10 * 1024 * 1024 },
-});
 
 // ==================== MONGODB ====================
 const client = new MongoClient(MONGO_URI);
@@ -112,6 +104,7 @@ async function connectDB() {
     await Contests.createIndex({ creator: 1 });
     await Registrations.createIndex({ user: 1, contest: 1 }, { unique: true });
     await Submissions.createIndex({ contest: 1, user: 1 });
+
     console.log("✅ MongoDB connected");
   } catch (error) {
     console.error("❌ MongoDB error:", error);
@@ -158,240 +151,6 @@ function requireRole(...roles) {
     next();
   };
 }
-
-// ==================== AUTH ROUTES ====================
-app.post("/api/auth/register", async (req, res) => {
-  try {
-    const { name, email, password, role } = req.body;
-    if (!name || !email || !password)
-      return res.status(400).json({ error: "Required fields missing" });
-
-    const hashed = await bcrypt.hash(password, 10);
-    const userDoc = {
-      name,
-      email: email.toLowerCase(),
-      password: hashed,
-      role: role === "creator" ? "creator" : "user",
-      photoURL: null,
-      bio: null,
-      address: null,
-      participatedCount: 0,
-      wonCount: 0,
-      createdAt: new Date(),
-    };
-
-    const result = await Users.insertOne(userDoc);
-    const user = await Users.findOne(
-      { _id: result.insertedId },
-      { projection: { password: 0 } }
-    );
-    const token = signToken(user);
-    return res.json({ user: { ...user, id: user._id.toString() }, token });
-  } catch (err) {
-    if (err.code === 11000)
-      return res.status(400).json({ error: "Email already registered" });
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const user = await Users.findOne({ email: email.toLowerCase() });
-    if (!user) return res.status(400).json({ error: "Invalid credentials" });
-
-    const match = await bcrypt.compare(password, user.password);
-    if (!match) return res.status(400).json({ error: "Invalid credentials" });
-
-    const token = signToken(user);
-    return res.json({
-      user: {
-        id: user._id.toString(),
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        photoURL: user.photoURL,
-        createdAt: user.createdAt,
-      },
-      token,
-    });
-  } catch {
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.post("/api/auth/google", async (req, res) => {
-  const { idToken } = req.body;
-  if (!idToken) return res.status(400).json({ error: "Missing idToken" });
-
-  try {
-    const decodedToken = await admin.auth().verifyIdToken(idToken);
-    const { uid, email, name, picture } = decodedToken;
-
-    let user = await Users.findOne({ email: email.toLowerCase() });
-    if (!user) {
-      const userDoc = {
-        name: name || email.split("@")[0],
-        email: email.toLowerCase(),
-        role: "user",
-        photoURL: picture || null,
-        bio: null,
-        address: null,
-        participatedCount: 0,
-        wonCount: 0,
-        firebaseUid: uid,
-        createdAt: new Date(),
-      };
-      const result = await Users.insertOne(userDoc);
-      user = await Users.findOne({ _id: result.insertedId });
-    }
-
-    const token = signToken(user);
-    res.json({
-      user: {
-        id: user._id.toString(),
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        photoURL: user.photoURL,
-        createdAt: user.createdAt,
-      },
-      token,
-    });
-  } catch (err) {
-    console.error("❌ Google auth error:", err);
-    res.status(401).json({ error: "Invalid Firebase token" });
-  }
-});
-
-app.get("/api/auth/me", authMiddleware, async (req, res) => {
-  const {
-    _id,
-    name,
-    email,
-    role,
-    photoURL,
-    bio,
-    address,
-    participatedCount,
-    wonCount,
-    createdAt,
-  } = req.user;
-  res.json({
-    user: {
-      id: _id.toString(),
-      name,
-      email,
-      role,
-      photoURL,
-      bio,
-      address,
-      participatedCount,
-      wonCount,
-      createdAt,
-    },
-  });
-});
-
-// ==================== USER ROUTES ====================
-app.put("/api/users/me", authMiddleware, async (req, res) => {
-  try {
-    const { name, photoURL, bio, address } = req.body;
-    const updates = {};
-    if (name) updates.name = name;
-    if (photoURL !== undefined) updates.photoURL = photoURL;
-    if (bio !== undefined) updates.bio = bio;
-    if (address !== undefined) updates.address = address;
-    updates.updatedAt = new Date();
-
-    await Users.updateOne(
-      { _id: new ObjectId(req.user._id) },
-      { $set: updates }
-    );
-    const user = await Users.findOne(
-      { _id: new ObjectId(req.user._id) },
-      { projection: { password: 0 } }
-    );
-    res.json({ user });
-  } catch {
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.get("/api/users/profile", authMiddleware, async (req, res) => {
-  try {
-    const user = await Users.findOne(
-      { _id: new ObjectId(req.user._id) },
-      { projection: { password: 0 } }
-    );
-    res.json({ user });
-  } catch {
-    res.status(500).json({ error: "Server error" });
-  }
-});
-app.put("/api/users/profile", authMiddleware, async (req, res) => {
-  try {
-    const { name, photoURL, bio, address } = req.body;
-    const updates = {};
-    if (name) updates.name = name;
-    if (photoURL !== undefined) updates.photoURL = photoURL;
-    if (bio !== undefined) updates.bio = bio;
-    if (address !== undefined) updates.address = address;
-    updates.updatedAt = new Date();
-
-    await Users.updateOne(
-      { _id: new ObjectId(req.user._id) },
-      { $set: updates }
-    );
-    const user = await Users.findOne(
-      { _id: new ObjectId(req.user._id) },
-      { projection: { password: 0 } }
-    );
-    res.json({ user });
-  } catch {
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.get(
-  "/api/users/participated-contests",
-  authMiddleware,
-  async (req, res) => {
-    try {
-      const registrations = await Registrations.find({
-        user: new ObjectId(req.user._id),
-      }).toArray();
-
-      const contests = await Promise.all(
-        registrations.map(async (reg) => {
-          const contest = await Contests.findOne({ _id: reg.contest });
-          return contest;
-        })
-      );
-
-      res.json({ contests: contests.filter(Boolean) });
-    } catch {
-      res.status(500).json({ error: "Server error" });
-    }
-  }
-);
-
-app.get("/api/users/won-contests", authMiddleware, async (req, res) => {
-  try {
-    const wins = await Submissions.find({
-      user: new ObjectId(req.user._id),
-      isWinner: true,
-    }).toArray();
-
-    const contests = await Promise.all(
-      wins.map(async (w) => await Contests.findOne({ _id: w.contest }))
-    );
-
-    res.json({ contests: contests.filter(Boolean) });
-  } catch {
-    res.status(500).json({ error: "Server error" });
-  }
-});
 
 // ==================== CONTEST ROUTES ====================
 app.post(
@@ -613,10 +372,8 @@ app.delete("/api/contests/:id", authMiddleware, async (req, res) => {
       });
     }
 
-    // Delete registrations
     await Registrations.deleteMany({ contest: new ObjectId(id) });
 
-    // Delete submission files from local storage
     const submissions = await Submissions.find({
       contest: new ObjectId(id),
     }).toArray();
@@ -941,6 +698,240 @@ app.post("/api/submissions/:id/winner", authMiddleware, async (req, res) => {
   );
   await Users.updateOne({ _id: sub.user }, { $inc: { wonCount: 1 } });
   res.json({ success: true });
+});
+
+// ==================== AUTH ROUTES ====================
+app.post("/api/auth/register", async (req, res) => {
+  try {
+    const { name, email, password, role } = req.body;
+    if (!name || !email || !password)
+      return res.status(400).json({ error: "Required fields missing" });
+
+    const hashed = await bcrypt.hash(password, 10);
+    const userDoc = {
+      name,
+      email: email.toLowerCase(),
+      password: hashed,
+      role: role === "creator" ? "creator" : "user",
+      photoURL: null,
+      bio: null,
+      address: null,
+      participatedCount: 0,
+      wonCount: 0,
+      createdAt: new Date(),
+    };
+
+    const result = await Users.insertOne(userDoc);
+    const user = await Users.findOne(
+      { _id: result.insertedId },
+      { projection: { password: 0 } }
+    );
+    const token = signToken(user);
+    return res.json({ user: { ...user, id: user._id.toString() }, token });
+  } catch (err) {
+    if (err.code === 11000)
+      return res.status(400).json({ error: "Email already registered" });
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await Users.findOne({ email: email.toLowerCase() });
+    if (!user) return res.status(400).json({ error: "Invalid credentials" });
+
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) return res.status(400).json({ error: "Invalid credentials" });
+
+    const token = signToken(user);
+    return res.json({
+      user: {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        photoURL: user.photoURL,
+        createdAt: user.createdAt,
+      },
+      token,
+    });
+  } catch {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/api/auth/google", async (req, res) => {
+  const { idToken } = req.body;
+  if (!idToken) return res.status(400).json({ error: "Missing idToken" });
+
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    const { uid, email, name, picture } = decodedToken;
+
+    let user = await Users.findOne({ email: email.toLowerCase() });
+    if (!user) {
+      const userDoc = {
+        name: name || email.split("@")[0],
+        email: email.toLowerCase(),
+        role: "user",
+        photoURL: picture || null,
+        bio: null,
+        address: null,
+        participatedCount: 0,
+        wonCount: 0,
+        firebaseUid: uid,
+        createdAt: new Date(),
+      };
+      const result = await Users.insertOne(userDoc);
+      user = await Users.findOne({ _id: result.insertedId });
+    }
+
+    const token = signToken(user);
+    res.json({
+      user: {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        photoURL: user.photoURL,
+        createdAt: user.createdAt,
+      },
+      token,
+    });
+  } catch (err) {
+    console.error("❌ Google auth error:", err);
+    res.status(401).json({ error: "Invalid Firebase token" });
+  }
+});
+
+app.get("/api/auth/me", authMiddleware, async (req, res) => {
+  const {
+    _id,
+    name,
+    email,
+    role,
+    photoURL,
+    bio,
+    address,
+    participatedCount,
+    wonCount,
+    createdAt,
+  } = req.user;
+  res.json({
+    user: {
+      id: _id.toString(),
+      name,
+      email,
+      role,
+      photoURL,
+      bio,
+      address,
+      participatedCount,
+      wonCount,
+      createdAt,
+    },
+  });
+});
+
+// ==================== USER ROUTES ====================
+app.put("/api/users/me", authMiddleware, async (req, res) => {
+  try {
+    const { name, photoURL, bio, address } = req.body;
+    const updates = {};
+    if (name) updates.name = name;
+    if (photoURL !== undefined) updates.photoURL = photoURL;
+    if (bio !== undefined) updates.bio = bio;
+    if (address !== undefined) updates.address = address;
+    updates.updatedAt = new Date();
+
+    await Users.updateOne(
+      { _id: new ObjectId(req.user._id) },
+      { $set: updates }
+    );
+    const user = await Users.findOne(
+      { _id: new ObjectId(req.user._id) },
+      { projection: { password: 0 } }
+    );
+    res.json({ user });
+  } catch {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/api/users/profile", authMiddleware, async (req, res) => {
+  try {
+    const user = await Users.findOne(
+      { _id: new ObjectId(req.user._id) },
+      { projection: { password: 0 } }
+    );
+    res.json({ user });
+  } catch {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+app.put("/api/users/profile", authMiddleware, async (req, res) => {
+  try {
+    const { name, photoURL, bio, address } = req.body;
+    const updates = {};
+    if (name) updates.name = name;
+    if (photoURL !== undefined) updates.photoURL = photoURL;
+    if (bio !== undefined) updates.bio = bio;
+    if (address !== undefined) updates.address = address;
+    updates.updatedAt = new Date();
+
+    await Users.updateOne(
+      { _id: new ObjectId(req.user._id) },
+      { $set: updates }
+    );
+    const user = await Users.findOne(
+      { _id: new ObjectId(req.user._id) },
+      { projection: { password: 0 } }
+    );
+    res.json({ user });
+  } catch {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get(
+  "/api/users/participated-contests",
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const registrations = await Registrations.find({
+        user: new ObjectId(req.user._id),
+      }).toArray();
+
+      const contests = await Promise.all(
+        registrations.map(async (reg) => {
+          const contest = await Contests.findOne({ _id: reg.contest });
+          return contest;
+        })
+      );
+
+      res.json({ contests: contests.filter(Boolean) });
+    } catch {
+      res.status(500).json({ error: "Server error" });
+    }
+  }
+);
+
+app.get("/api/users/won-contests", authMiddleware, async (req, res) => {
+  try {
+    const wins = await Submissions.find({
+      user: new ObjectId(req.user._id),
+      isWinner: true,
+    }).toArray();
+
+    const contests = await Promise.all(
+      wins.map(async (w) => await Contests.findOne({ _id: w.contest }))
+    );
+
+    res.json({ contests: contests.filter(Boolean) });
+  } catch {
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
 // ==================== PAYMENT ROUTES ====================
@@ -1590,18 +1581,18 @@ app.get("/api/stats", authMiddleware, async (req, res) => {
   }
 });
 
-// Health
+// ==================== HEALTH CHECK ====================
 app.get("/", (req, res) => res.send("✅ ContestHub API running"));
 app.get("/health", (req, res) => res.json({ ok: true, timestamp: new Date() }));
 
-// Start server
+// ==================== START SERVER ====================
 connectDB().then(() => {
   app.listen(PORT, () =>
     console.log(`🚀 Server running on http://localhost:${PORT}`)
   );
 });
 
-// Central error handler
+// ==================== CENTRAL ERROR HANDLER ====================
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err && (err.stack || err.message || err));
   if (res.headersSent) return next(err);
@@ -1609,3 +1600,5 @@ app.use((err, req, res, next) => {
     .status(err && err.status ? err.status : 500)
     .json({ error: "Server error" });
 });
+
+module.exports = app;
