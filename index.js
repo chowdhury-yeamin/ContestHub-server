@@ -62,11 +62,9 @@ try {
 // ==================== EXPRESS APP ====================
 const app = express();
 
-// CRITICAL FIX: Parse JSON BEFORE applying CORS middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// FIXED CORS CONFIGURATION
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:3000",
@@ -78,14 +76,10 @@ const allowedOrigins = [
 
 console.log("🌐 Allowed CORS origins:", allowedOrigins);
 
-// CRITICAL FIX: More permissive CORS configuration for production
 app.use(
   cors({
     origin: function (origin, callback) {
-      // Allow requests with no origin (mobile apps, Postman, etc.)
       if (!origin) return callback(null, true);
-
-      // Check if origin is in allowed list
       if (allowedOrigins.indexOf(origin) !== -1) {
         callback(null, true);
       } else {
@@ -108,9 +102,6 @@ app.use(
     optionsSuccessStatus: 204,
   })
 );
-
-// CRITICAL FIX: Handle OPTIONS preflight requests explicitly
-app.options("*", cors());
 
 // ==================== MONGODB ====================
 const client = new MongoClient(MONGO_URI);
@@ -801,9 +792,9 @@ app.post("/api/auth/login", async (req, res) => {
 
 app.post("/api/auth/google", async (req, res) => {
   const { idToken } = req.body;
-  
-  console.log("🔐 Google auth request from:", req.headers.origin);
-  
+
+  console.log(" Google auth request from:", req.headers.origin);
+
   if (!idToken) {
     return res.status(400).json({ error: "Missing idToken" });
   }
@@ -831,9 +822,9 @@ app.post("/api/auth/google", async (req, res) => {
     }
 
     const token = signToken(user);
-    
+
     console.log("✅ Google auth successful for:", email);
-    
+
     res.json({
       user: {
         id: user._id.toString(),
@@ -1626,7 +1617,6 @@ app.get("/api/stats", authMiddleware, async (req, res) => {
     res.status(500).json({ error: "Failed to load stats" });
   }
 });
-
 
 // ==================== START SERVER ====================
 connectDB().then(() => {
