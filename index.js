@@ -10,11 +10,13 @@ const fs = require("fs-extra");
 const path = require("path");
 const multer = require("multer");
 
-// ==================== CONFIGURATION ====================
 const PORT = process.env.PORT || 5000;
 const MONGO_URI = process.env.MONGO_URI;
 const DB_NAME = process.env.DB_NAME || "contesthub";
-if (!process.env.JWT_SECRET) throw new Error("JWT_SECRET is required");
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET) throw new Error("JWT_SECRET is required");
+
 const UPLOADS_DIR = path.join("/tmp", "uploads");
 fs.ensureDirSync(UPLOADS_DIR);
 
@@ -22,7 +24,7 @@ fs.ensureDirSync(UPLOADS_DIR);
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOADS_DIR),
   filename: (req, file, cb) =>
-    `${Date.now()}-${file.originalname.replace(/\s+/g, "_")}`,
+    cb(null, `${Date.now()}-${file.originalname.replace(/\s+/g, "_")}`),
 });
 const upload = multer({ storage });
 
@@ -60,9 +62,11 @@ try {
 // ==================== EXPRESS APP ====================
 const app = express();
 
+// CRITICAL FIX: Parse JSON BEFORE applying CORS middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// FIXED CORS CONFIGURATION
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:3000",
@@ -72,20 +76,41 @@ const allowedOrigins = [
   process.env.SITE_DOMAIN,
 ].filter(Boolean);
 
+console.log("🌐 Allowed CORS origins:", allowedOrigins);
+
+// CRITICAL FIX: More permissive CORS configuration for production
 app.use(
   cors({
-    origin: (origin, callback) => {
+    origin: function (origin, callback) {
+      // Allow requests with no origin (mobile apps, Postman, etc.)
       if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin)) callback(null, true);
-      else callback(new Error("Not allowed by CORS"));
+
+      // Check if origin is in allowed list
+      if (allowedOrigins.indexOf(origin) !== -1) {
+        callback(null, true);
+      } else {
+        console.warn("⚠️ Blocked by CORS:", origin);
+        callback(new Error("Not allowed by CORS"));
+      }
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Requested-With",
+      "Accept",
+      "Origin",
+    ],
     exposedHeaders: ["Content-Length", "X-Request-Id"],
-    maxAge: 86400,
+    maxAge: 86400, // 24 hours
+    preflightContinue: false,
+    optionsSuccessStatus: 204,
   })
 );
+
+// CRITICAL FIX: Handle OPTIONS preflight requests explicitly
+app.options("*", cors());
 
 // ==================== MONGODB ====================
 const client = new MongoClient(MONGO_URI);
@@ -151,6 +176,19 @@ function requireRole(...roles) {
     next();
   };
 }
+
+// ==================== HEALTH CHECK ====================
+app.get("/", (req, res) => {
+  res.json({
+    status: "ok",
+    message: "ContestHub API running",
+    allowedOrigins: allowedOrigins.length,
+  });
+});
+
+app.get("/health", (req, res) => {
+  res.json({ ok: true, timestamp: new Date() });
+});
 
 // ==================== CONTEST ROUTES ====================
 app.post(
@@ -763,7 +801,12 @@ app.post("/api/auth/login", async (req, res) => {
 
 app.post("/api/auth/google", async (req, res) => {
   const { idToken } = req.body;
-  if (!idToken) return res.status(400).json({ error: "Missing idToken" });
+  
+  console.log("🔐 Google auth request from:", req.headers.origin);
+  
+  if (!idToken) {
+    return res.status(400).json({ error: "Missing idToken" });
+  }
 
   try {
     const decodedToken = await admin.auth().verifyIdToken(idToken);
@@ -788,6 +831,9 @@ app.post("/api/auth/google", async (req, res) => {
     }
 
     const token = signToken(user);
+    
+    console.log("✅ Google auth successful for:", email);
+    
     res.json({
       user: {
         id: user._id.toString(),
@@ -1581,9 +1627,6 @@ app.get("/api/stats", authMiddleware, async (req, res) => {
   }
 });
 
-// ==================== HEALTH CHECK ====================
-app.get("/", (req, res) => res.send("✅ ContestHub API running"));
-app.get("/health", (req, res) => res.json({ ok: true, timestamp: new Date() }));
 
 // ==================== START SERVER ====================
 connectDB().then(() => {
