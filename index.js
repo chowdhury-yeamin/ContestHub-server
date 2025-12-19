@@ -1026,7 +1026,7 @@ app.get(
 
 app.get("/api/contests", async (req, res) => {
   try {
-    const { page = 1, limit = 20, status, type, creator } = req.query;
+    const { page = 1, limit = 10, status, type, creator } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
     const filter = {};
     if (status) filter.status = status;
