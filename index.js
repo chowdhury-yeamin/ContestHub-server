@@ -30,7 +30,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({
   storage: storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+  limits: { fileSize: 10 * 1024 * 1024 },
 });
 
 // ==================== FIREBASE ADMIN ====================
@@ -65,7 +65,6 @@ try {
 // ==================== EXPRESS APP ====================
 const app = express();
 
-// Parse JSON and URL-encoded bodies FIRST
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -89,7 +88,7 @@ app.use(
         callback(null, true);
       } else {
         console.warn("⚠️ Blocked by CORS:", origin);
-        callback(new Error("Not allowed by CORS"));
+        callback(null, true);
       }
     },
     credentials: true,
@@ -102,60 +101,68 @@ app.use(
       "Origin",
     ],
     exposedHeaders: ["Content-Length", "X-Request-Id"],
-    maxAge: 86400, // 24 hours
+    maxAge: 86400,
     preflightContinue: false,
     optionsSuccessStatus: 204,
   })
 );
 
-// ==================== MONGODB ====================
-const client = new MongoClient(MONGO_URI);
-let db, Users, Contests, Registrations, Submissions;
-
-let cachedClient = null;
+// ==================== MONGODB CONNECTION ====================
 let cachedDb = null;
+let cachedClient = null;
 
 async function connectToDatabase() {
-  if (cachedClient && cachedDb) {
-    return { client: cachedClient, db: cachedDb };
+  if (cachedDb && cachedClient) {
+    return { db: cachedDb, client: cachedClient };
   }
 
-  const client = await MongoClient.connect(process.env.MONGO_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
+  const client = await MongoClient.connect(MONGO_URI, {
     maxPoolSize: 10,
     serverSelectionTimeoutMS: 5000,
+    socketTimeoutMS: 45000,
   });
 
-  const db = client.db(process.env.DB_NAME || "contesthub");
+  const db = client.db(DB_NAME);
   cachedClient = client;
   cachedDb = db;
-  return { client, db };
+
+  return { db, client };
 }
 
-async function connectDB() {
-  const { db: database } = await connectToDatabase();
-  db = database;
-  Users = db.collection("users");
-  Contests = db.collection("contests");
-  Registrations = db.collection("registrations");
-  Submissions = db.collection("submissions");
+// Global variables for collections
+let Users, Contests, Registrations, Submissions;
 
-  await Promise.all([
-    Users.createIndex({ email: 1 }, { unique: true }).catch(() => {}),
-    Contests.createIndex({ creator: 1 }).catch(() => {}),
-    Registrations.createIndex({ user: 1, contest: 1 }, { unique: true }).catch(
-      () => {}
-    ),
-    Submissions.createIndex({ contest: 1, user: 1 }).catch(() => {}),
-  ]);
+async function ensureDbConnection(req, res, next) {
+  try {
+    if (!cachedDb) {
+      const { db } = await connectToDatabase();
+      Users = db.collection("users");
+      Contests = db.collection("contests");
+      Registrations = db.collection("registrations");
+      Submissions = db.collection("submissions");
 
-  return db;
+      await Promise.all([
+        Users.createIndex({ email: 1 }, { unique: true }).catch(() => {}),
+        Contests.createIndex({ creator: 1 }).catch(() => {}),
+        Registrations.createIndex(
+          { user: 1, contest: 1 },
+          { unique: true }
+        ).catch(() => {}),
+        Submissions.createIndex({ contest: 1, user: 1 }).catch(() => {}),
+      ]);
+    }
+    next();
+  } catch (error) {
+    console.error("❌ Database connection error:", error);
+    res.status(500).json({ error: "Database connection failed" });
+  }
 }
 
-process.on("SIGINT", async () => {
-  await client.close();
-  process.exit(0);
+app.use((req, res, next) => {
+  if (req.path === "/" || req.path === "/health") {
+    return next();
+  }
+  return ensureDbConnection(req, res, next);
 });
 
 // ==================== HELPER FUNCTIONS ====================
@@ -198,560 +205,13 @@ app.get("/", (req, res) => {
   res.json({
     status: "ok",
     message: "ContestHub API running",
+    timestamp: new Date(),
     allowedOrigins: allowedOrigins.length,
   });
 });
 
 app.get("/health", (req, res) => {
   res.json({ ok: true, timestamp: new Date() });
-});
-
-// ==================== CONTEST ROUTES ====================
-app.post(
-  "/api/contests",
-  authMiddleware,
-  requireRole("creator"),
-  async (req, res) => {
-    try {
-      const {
-        name,
-        description,
-        image,
-        type,
-        prizeMoney,
-        deadline,
-        entryFee,
-        participantsLimit,
-        tags,
-        taskInstruction,
-      } = req.body;
-
-      if (!name || !description || !deadline) {
-        return res.status(400).json({ error: "Required fields missing" });
-      }
-
-      const slug =
-        name
-          .toLowerCase()
-          .replace(/[^a-z0-9]+/g, "-")
-          .replace(/^-+|-+$/g, "") +
-        "-" +
-        Date.now();
-
-      const creatorId =
-        req.user._id instanceof ObjectId
-          ? req.user._id
-          : new ObjectId(req.user._id);
-
-      const contest = {
-        name,
-        slug,
-        description,
-        image: image || "https://via.placeholder.com/400x300",
-        type: type || "general",
-        contestType: type || "general",
-        prizeMoney: Number(prizeMoney) || 0,
-        deadline: new Date(deadline),
-        entryFee: Number(entryFee) || 0,
-        participantsLimit: participantsLimit ? Number(participantsLimit) : null,
-        tags: Array.isArray(tags) ? tags : [],
-        taskInstruction: taskInstruction || "",
-        creator: creatorId,
-        creatorName: req.user.name,
-        creatorEmail: req.user.email,
-        status: "pending",
-        participantsCount: 0,
-        submissionsCount: 0,
-        winner: null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
-      const result = await Contests.insertOne(contest);
-      const createdContest = await Contests.findOne({ _id: result.insertedId });
-
-      res.status(201).json({
-        success: true,
-        contest: createdContest,
-      });
-    } catch (err) {
-      console.error("❌ Contest creation error:", err.message);
-      res.status(500).json({
-        error: err.message,
-        details: "Failed to create contest",
-      });
-    }
-  }
-);
-
-app.get("/api/contests", async (req, res) => {
-  try {
-    const { page = 1, limit = 20, status, type, creator } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const filter = {};
-    if (status) filter.status = status;
-    if (type) filter.type = type;
-    if (creator && ObjectId.isValid(creator))
-      filter.creator = new ObjectId(creator);
-
-    const contests = await Contests.find(filter)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(parseInt(limit))
-      .toArray();
-    const total = await Contests.countDocuments(filter);
-    res.json({
-      contests,
-      total,
-      page: parseInt(page),
-      pages: Math.ceil(total / parseInt(limit)),
-    });
-  } catch {
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.get("/api/contests/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ error: "Invalid contest ID" });
-    }
-
-    const contest = await Contests.findOne({ _id: new ObjectId(id) });
-
-    if (!contest) {
-      return res.status(404).json({ error: "Contest not found" });
-    }
-
-    res.json({ contest });
-  } catch (error) {
-    console.error("❌ Error fetching contest:", error);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.put("/api/contests/:id", authMiddleware, async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ error: "Invalid contest ID" });
-    }
-
-    const contest = await Contests.findOne({ _id: new ObjectId(id) });
-
-    if (!contest) {
-      return res.status(404).json({ error: "Contest not found" });
-    }
-
-    if (
-      req.user.role !== "admin" &&
-      contest.creator.toString() !== req.user._id.toString()
-    ) {
-      return res.status(403).json({ error: "Forbidden" });
-    }
-
-    const {
-      name,
-      description,
-      image,
-      type,
-      prizeMoney,
-      deadline,
-      entryFee,
-      participantsLimit,
-      tags,
-      taskInstruction,
-    } = req.body;
-
-    const updates = {};
-    if (name) updates.name = name;
-    if (description) updates.description = description;
-    if (image) updates.image = image;
-    if (type) {
-      updates.type = type;
-      updates.contestType = type;
-    }
-    if (prizeMoney !== undefined) updates.prizeMoney = Number(prizeMoney);
-    if (deadline) updates.deadline = new Date(deadline);
-    if (entryFee !== undefined) updates.entryFee = Number(entryFee);
-    if (participantsLimit !== undefined) {
-      updates.participantsLimit = participantsLimit
-        ? Number(participantsLimit)
-        : null;
-    }
-    if (tags) updates.tags = Array.isArray(tags) ? tags : [];
-    if (taskInstruction !== undefined)
-      updates.taskInstruction = taskInstruction;
-    updates.updatedAt = new Date();
-
-    await Contests.updateOne({ _id: new ObjectId(id) }, { $set: updates });
-
-    const updatedContest = await Contests.findOne({ _id: new ObjectId(id) });
-    res.json({ success: true, contest: updatedContest });
-  } catch (error) {
-    console.error("❌ Error updating contest:", error);
-    res.status(500).json({ error: "Failed to update contest" });
-  }
-});
-
-app.delete("/api/contests/:id", authMiddleware, async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ error: "Invalid contest ID" });
-    }
-
-    const contest = await Contests.findOne({ _id: new ObjectId(id) });
-
-    if (!contest) {
-      return res.status(404).json({ error: "Contest not found" });
-    }
-
-    if (
-      req.user.role !== "admin" &&
-      contest.creator.toString() !== req.user._id.toString()
-    ) {
-      return res
-        .status(403)
-        .json({ error: "Forbidden - You can only delete your own contests" });
-    }
-
-    if (contest.status !== "pending" && req.user.role !== "admin") {
-      return res.status(400).json({
-        error: "Cannot delete confirmed or rejected contests",
-      });
-    }
-
-    await Registrations.deleteMany({ contest: new ObjectId(id) });
-
-    const submissions = await Submissions.find({
-      contest: new ObjectId(id),
-    }).toArray();
-
-    for (const submission of submissions) {
-      if (submission.filePath) {
-        try {
-          const filePath = path.join(UPLOADS_DIR, submission.filePath);
-          await fs.remove(filePath);
-          console.log("🗑️ Deleted local file:", submission.filePath);
-        } catch (err) {
-          console.warn(
-            "⚠️ Error deleting local file:",
-            submission.filePath,
-            err.message
-          );
-        }
-      }
-    }
-
-    await Submissions.deleteMany({ contest: new ObjectId(id) });
-    await Contests.deleteOne({ _id: new ObjectId(id) });
-
-    console.log("✅ Contest deleted successfully");
-    res.json({ success: true, message: "Contest deleted successfully" });
-  } catch (error) {
-    console.error("❌ Error deleting contest:", error);
-    res.status(500).json({ error: "Failed to delete contest" });
-  }
-});
-
-app.get(
-  "/api/contests/creator/my-contests",
-  authMiddleware,
-  requireRole("creator"),
-  async (req, res) => {
-    try {
-      const contests = await Contests.find({ creator: req.user._id })
-        .sort({ createdAt: -1 })
-        .toArray();
-      res.json({ contests });
-    } catch (error) {
-      res.status(500).json({ error: "Failed to fetch contests" });
-    }
-  }
-);
-
-app.get("/api/contests/:id/my-submission", authMiddleware, async (req, res) => {
-  const { id } = req.params;
-
-  if (!ObjectId.isValid(id))
-    return res.status(400).json({ error: "Invalid id" });
-
-  try {
-    const submission = await Submissions.findOne({
-      contest: new ObjectId(id),
-      user: new ObjectId(req.user._id),
-    });
-
-    res.json({ submission: submission || null });
-  } catch (error) {
-    console.error("❌ Error fetching user submission:", error);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// ==================== REGISTRATION ROUTES ====================
-app.post("/api/contests/:id/register", authMiddleware, async (req, res) => {
-  const { id } = req.params;
-  if (!ObjectId.isValid(id))
-    return res.status(400).json({ error: "Invalid id" });
-
-  try {
-    const contest = await Contests.findOne({ _id: new ObjectId(id) });
-    if (!contest) return res.status(404).json({ error: "Contest not found" });
-    if (contest.status !== "confirmed")
-      return res.status(400).json({ error: "Contest not available" });
-
-    const reg = {
-      user: new ObjectId(req.user._id),
-      contest: new ObjectId(id),
-      paymentStatus: "completed",
-      submissionStatus: "pending",
-      registeredAt: new Date(),
-    };
-
-    await Registrations.insertOne(reg);
-    await Contests.updateOne(
-      { _id: new ObjectId(id) },
-      { $inc: { participantsCount: 1 } }
-    );
-    await Users.updateOne(
-      { _id: new ObjectId(req.user._id) },
-      { $inc: { participatedCount: 1 } }
-    );
-    res.json({ success: true, registration: reg });
-  } catch (err) {
-    if (err.code === 11000)
-      return res.status(400).json({ error: "Already registered" });
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.get("/api/users/me/registrations", authMiddleware, async (req, res) => {
-  const regs = await Registrations.find({
-    user: new ObjectId(req.user._id),
-  }).toArray();
-  const contests = await Promise.all(
-    regs.map(async (r) => ({
-      ...r,
-      contest: await Contests.findOne({ _id: r.contest }),
-    }))
-  );
-  res.json({ registrations: contests });
-});
-app.get("/api/users/me/wins", authMiddleware, async (req, res) => {
-  const wins = await Submissions.find({
-    user: new ObjectId(req.user._id),
-    isWinner: true,
-  }).toArray();
-  const contests = await Promise.all(
-    wins.map(async (w) => ({
-      ...w,
-      contest: await Contests.findOne({ _id: w.contest }),
-      wonAt: w.updatedAt || w.createdAt,
-    }))
-  );
-  res.json({ wins: contests });
-});
-
-// ==================== SUBMISSION ROUTES ====================
-app.post(
-  "/api/contests/:id/submit",
-  authMiddleware,
-  upload.single("file"),
-  async (req, res) => {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      if (req.file) await fs.remove(req.file.path);
-      return res.status(400).json({ error: "Invalid id" });
-    }
-
-    try {
-      const contest = await Contests.findOne({ _id: new ObjectId(id) });
-      if (!contest) {
-        if (req.file) await fs.remove(req.file.path);
-        return res.status(404).json({ error: "Contest not found" });
-      }
-
-      const registration = await Registrations.findOne({
-        user: new ObjectId(req.user._id),
-        contest: new ObjectId(id),
-      });
-      if (!registration) {
-        if (req.file) await fs.remove(req.file.path);
-        return res.status(400).json({ error: "Must register first" });
-      }
-
-      const submission = {
-        contest: new ObjectId(id),
-        user: new ObjectId(req.user._id),
-        userName: req.user.name,
-        submission: req.body.submission || req.file?.filename || "",
-        filePath: req.file ? req.file.filename : null,
-        fileOriginalName: req.file ? req.file.originalname : null,
-        submittedAt: new Date(),
-        isWinner: false,
-      };
-
-      const result = await Submissions.insertOne(submission);
-      await Contests.updateOne(
-        { _id: new ObjectId(id) },
-        { $inc: { submissionsCount: 1 } }
-      );
-      await Registrations.updateOne(
-        { user: new ObjectId(req.user._id), contest: new ObjectId(id) },
-        { $set: { submissionStatus: "submitted" } }
-      );
-      res.json({
-        submission: await Submissions.findOne({ _id: result.insertedId }),
-      });
-    } catch (error) {
-      if (req.file) await fs.remove(req.file.path);
-      console.error("❌ Error submitting:", error);
-      res.status(500).json({ error: "Server error" });
-    }
-  }
-);
-
-app.get("/api/contests/:id/submissions", authMiddleware, async (req, res) => {
-  const { id } = req.params;
-
-  if (!ObjectId.isValid(id))
-    return res.status(400).json({ error: "Invalid id" });
-
-  const contest = await Contests.findOne({ _id: new ObjectId(id) });
-  if (!contest) return res.status(404).json({ error: "Contest not found" });
-
-  if (
-    req.user.role !== "admin" &&
-    contest.creator.toString() !== req.user._id.toString()
-  )
-    return res.status(403).json({ error: "Forbidden" });
-
-  const submissions = await Submissions.aggregate([
-    { $match: { contest: new ObjectId(id) } },
-    {
-      $lookup: {
-        from: "users",
-        localField: "user",
-        foreignField: "_id",
-        as: "participant",
-      },
-    },
-    { $unwind: "$participant" },
-    {
-      $project: {
-        _id: 1,
-        submission: 1,
-        submittedAt: 1,
-        isWinner: 1,
-        filePath: 1,
-        fileOriginalName: 1,
-        participant: { _id: 1, name: 1, email: 1, photoURL: 1 },
-      },
-    },
-  ]).toArray();
-
-  res.json({ submissions });
-});
-
-app.get(
-  "/api/creator/all-submissions",
-  authMiddleware,
-  requireRole("creator"),
-  async (req, res) => {
-    try {
-      const creatorContests = await Contests.find({
-        creator: new ObjectId(req.user._id),
-      }).toArray();
-
-      const contestIds = creatorContests.map((c) => c._id);
-
-      if (contestIds.length === 0) {
-        return res.json({ submissions: [] });
-      }
-
-      const submissions = await Submissions.aggregate([
-        { $match: { contest: { $in: contestIds } } },
-        {
-          $lookup: {
-            from: "users",
-            localField: "user",
-            foreignField: "_id",
-            as: "participant",
-          },
-        },
-        { $unwind: "$participant" },
-        {
-          $lookup: {
-            from: "contests",
-            localField: "contest",
-            foreignField: "_id",
-            as: "contestInfo",
-          },
-        },
-        { $unwind: "$contestInfo" },
-        {
-          $project: {
-            _id: 1,
-            submission: 1,
-            submittedAt: 1,
-            isWinner: 1,
-            filePath: 1,
-            fileOriginalName: 1,
-            contest: "$contestInfo._id",
-            contestName: "$contestInfo.name",
-            contestDeadline: "$contestInfo.deadline",
-            contestPrizeMoney: "$contestInfo.prizeMoney",
-            participant: {
-              _id: 1,
-              name: 1,
-              email: 1,
-              photoURL: 1,
-            },
-          },
-        },
-        { $sort: { submittedAt: -1 } },
-      ]).toArray();
-
-      res.json({ submissions });
-    } catch (error) {
-      console.error("❌ Error fetching all submissions:", error);
-      res.status(500).json({ error: "Failed to fetch submissions" });
-    }
-  }
-);
-
-app.post("/api/submissions/:id/winner", authMiddleware, async (req, res) => {
-  const { id } = req.params;
-  if (!ObjectId.isValid(id))
-    return res.status(400).json({ error: "Invalid id" });
-
-  const sub = await Submissions.findOne({ _id: new ObjectId(id) });
-  if (!sub) return res.status(404).json({ error: "Submission not found" });
-
-  const contest = await Contests.findOne({ _id: sub.contest });
-  if (!contest) return res.status(404).json({ error: "Contest not found" });
-  if (
-    req.user.role !== "admin" &&
-    contest.creator.toString() !== req.user._id.toString()
-  )
-    return res.status(403).json({ error: "Forbidden" });
-
-  await Submissions.updateOne(
-    { _id: new ObjectId(id) },
-    { $set: { isWinner: true, updatedAt: new Date() } }
-  );
-  await Contests.updateOne(
-    { _id: contest._id },
-    { $set: { winner: sub.user } }
-  );
-  await Users.updateOne({ _id: sub.user }, { $inc: { wonCount: 1 } });
-  res.json({ success: true });
 });
 
 // ==================== AUTH ROUTES ====================
@@ -818,7 +278,7 @@ app.post("/api/auth/login", async (req, res) => {
 app.post("/api/auth/google", async (req, res) => {
   const { idToken } = req.body;
 
-  console.log(" Google auth request from:", req.headers.origin);
+  console.log("🔐 Google auth request from:", req.headers.origin);
 
   if (!idToken) {
     return res.status(400).json({ error: "Missing idToken" });
@@ -1564,6 +1024,34 @@ app.get(
   }
 );
 
+app.get("/api/contests", async (req, res) => {
+  try {
+    const { page = 1, limit = 20, status, type, creator } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const filter = {};
+    if (status) filter.status = status;
+    if (type) filter.type = type;
+    if (creator && ObjectId.isValid(creator))
+      filter.creator = new ObjectId(creator);
+
+    const contests = await Contests.find(filter)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit))
+      .toArray();
+    const total = await Contests.countDocuments(filter);
+    res.json({
+      contests,
+      total,
+      page: parseInt(page),
+      pages: Math.ceil(total / parseInt(limit)),
+    });
+  } catch (error) {
+    console.error("❌ Error:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 // ==================== STATS ROUTE ====================
 app.get("/api/stats", authMiddleware, async (req, res) => {
   try {
@@ -1643,13 +1131,6 @@ app.get("/api/stats", authMiddleware, async (req, res) => {
   }
 });
 
-// ==================== START SERVER ====================
-connectDB().then(() => {
-  app.listen(PORT, () =>
-    console.log(`🚀 Server running on http://localhost:${PORT}`)
-  );
-});
-
 // ==================== CENTRAL ERROR HANDLER ====================
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err && (err.stack || err.message || err));
@@ -1659,8 +1140,4 @@ app.use((err, req, res, next) => {
     .json({ error: "Server error" });
 });
 
-connectDB().then(() => {
-  app.listen(PORT, () =>
-    console.log(`🚀 Server running on http://localhost:${PORT}`)
-  );
-});
+module.exports = app;

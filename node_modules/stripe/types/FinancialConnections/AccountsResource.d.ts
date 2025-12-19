@@ -30,14 +30,19 @@ declare module 'stripe' {
       namespace AccountListParams {
         interface AccountHolder {
           /**
-           * The ID of the Stripe account whose accounts will be retrieved.
+           * The ID of the Stripe account whose accounts you will retrieve.
            */
           account?: string;
 
           /**
-           * The ID of the Stripe customer whose accounts will be retrieved.
+           * The ID of the Stripe customer whose accounts you will retrieve.
            */
           customer?: string;
+
+          /**
+           * The ID of the Account representing a customer whose accounts you will retrieve.
+           */
+          customer_account?: string;
         }
       }
 
@@ -157,7 +162,7 @@ declare module 'stripe' {
         ): Promise<Stripe.Response<Stripe.FinancialConnections.Account>>;
 
         /**
-         * Subscribes to periodic refreshes of data associated with a Financial Connections Account.
+         * Subscribes to periodic refreshes of data associated with a Financial Connections Account. When the account status is active, data is typically refreshed once a day.
          */
         subscribe(
           id: string,
