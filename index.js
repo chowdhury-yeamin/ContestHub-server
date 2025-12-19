@@ -59,6 +59,11 @@ try {
   console.error("❌ Firebase Admin error:", error.message);
 }
 
+app.use(async (req, res, next) => {
+  if (!db) await connectDB();
+  next();
+});
+
 // ==================== EXPRESS APP ====================
 const app = express();
 
@@ -107,25 +112,45 @@ app.use(
 const client = new MongoClient(MONGO_URI);
 let db, Users, Contests, Registrations, Submissions;
 
-async function connectDB() {
-  try {
-    await client.connect();
-    db = client.db(DB_NAME);
-    Users = db.collection("users");
-    Contests = db.collection("contests");
-    Registrations = db.collection("registrations");
-    Submissions = db.collection("submissions");
+let cachedClient = null;
+let cachedDb = null;
 
-    await Users.createIndex({ email: 1 }, { unique: true });
-    await Contests.createIndex({ creator: 1 });
-    await Registrations.createIndex({ user: 1, contest: 1 }, { unique: true });
-    await Submissions.createIndex({ contest: 1, user: 1 });
-
-    console.log("✅ MongoDB connected");
-  } catch (error) {
-    console.error("❌ MongoDB error:", error);
-    process.exit(1);
+async function connectToDatabase() {
+  if (cachedClient && cachedDb) {
+    return { client: cachedClient, db: cachedDb };
   }
+
+  const client = await MongoClient.connect(process.env.MONGO_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+    maxPoolSize: 10,
+    serverSelectionTimeoutMS: 5000,
+  });
+
+  const db = client.db(process.env.DB_NAME || "contesthub");
+  cachedClient = client;
+  cachedDb = db;
+  return { client, db };
+}
+
+async function connectDB() {
+  const { db: database } = await connectToDatabase();
+  db = database;
+  Users = db.collection("users");
+  Contests = db.collection("contests");
+  Registrations = db.collection("registrations");
+  Submissions = db.collection("submissions");
+
+  await Promise.all([
+    Users.createIndex({ email: 1 }, { unique: true }).catch(() => {}),
+    Contests.createIndex({ creator: 1 }).catch(() => {}),
+    Registrations.createIndex({ user: 1, contest: 1 }, { unique: true }).catch(
+      () => {}
+    ),
+    Submissions.createIndex({ contest: 1, user: 1 }).catch(() => {}),
+  ]);
+
+  return db;
 }
 
 process.on("SIGINT", async () => {
