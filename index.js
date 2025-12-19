@@ -10,29 +10,33 @@ const fs = require("fs-extra");
 const path = require("path");
 const multer = require("multer");
 
+// ==================== CONFIGURATION ====================
 const PORT = process.env.PORT || 5000;
 const MONGO_URI = process.env.MONGO_URI;
 const DB_NAME = process.env.DB_NAME || "contesthub";
 const JWT_SECRET = process.env.JWT_SECRET;
 
 if (!JWT_SECRET) throw new Error("JWT_SECRET is required");
+if (!MONGO_URI) throw new Error("MONGO_URI is required");
 
 const UPLOADS_DIR = path.join("/tmp", "uploads");
 fs.ensureDirSync(UPLOADS_DIR);
 
-// Multer setup
+// ==================== MULTER SETUP ====================
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOADS_DIR),
   filename: (req, file, cb) =>
     cb(null, `${Date.now()}-${file.originalname.replace(/\s+/g, "_")}`),
 });
-const upload = multer({ storage });
+const upload = multer({
+  storage: storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+});
 
 // ==================== FIREBASE ADMIN ====================
 try {
-  let serviceAccount;
   if (process.env.FB_SERVICE_KEY) {
-    serviceAccount = JSON.parse(
+    const serviceAccount = JSON.parse(
       Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString("utf8")
     );
     if (!admin.apps.length) {
@@ -42,7 +46,7 @@ try {
     }
     console.log("✅ Firebase Admin initialized from FB_SERVICE_KEY");
   } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-    serviceAccount = require(process.env.GOOGLE_APPLICATION_CREDENTIALS);
+    const serviceAccount = require(process.env.GOOGLE_APPLICATION_CREDENTIALS);
     if (!admin.apps.length) {
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
@@ -52,24 +56,20 @@ try {
       "✅ Firebase Admin initialized from GOOGLE_APPLICATION_CREDENTIALS"
     );
   } else {
-    admin.initializeApp();
-    console.log("✅ Firebase Admin initialized (default)");
+    console.warn("⚠️ Firebase Admin not initialized - no credentials found");
   }
 } catch (error) {
   console.error("❌ Firebase Admin error:", error.message);
 }
 
-app.use(async (req, res, next) => {
-  if (!db) await connectDB();
-  next();
-});
-
 // ==================== EXPRESS APP ====================
 const app = express();
 
+// Parse JSON and URL-encoded bodies FIRST
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// ==================== CORS CONFIGURATION ====================
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:3000",
@@ -1659,4 +1659,8 @@ app.use((err, req, res, next) => {
     .json({ error: "Server error" });
 });
 
-module.exports = app;
+connectDB().then(() => {
+  app.listen(PORT, () =>
+    console.log(`🚀 Server running on http://localhost:${PORT}`)
+  );
+});
