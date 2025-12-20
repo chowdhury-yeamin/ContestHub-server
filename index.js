@@ -356,6 +356,34 @@ app.get("/api/auth/me", authMiddleware, async (req, res) => {
   });
 });
 
+app.get("/api/users/me/registrations", authMiddleware, async (req, res) => {
+  const regs = await Registrations.find({
+    user: new ObjectId(req.user._id),
+  }).toArray();
+  const contests = await Promise.all(
+    regs.map(async (r) => ({
+      ...r,
+      contest: await Contests.findOne({ _id: r.contest }),
+    }))
+  );
+  res.json({ registrations: contests });
+});
+
+app.get("/api/users/me/wins", authMiddleware, async (req, res) => {
+  const wins = await Submissions.find({
+    user: new ObjectId(req.user._id),
+    isWinner: true,
+  }).toArray();
+  const contests = await Promise.all(
+    wins.map(async (w) => ({
+      ...w,
+      contest: await Contests.findOne({ _id: w.contest }),
+      wonAt: w.updatedAt || w.createdAt,
+    }))
+  );
+  res.json({ wins: contests });
+});
+
 // ==================== USER ROUTES ====================
 app.put("/api/users/me", authMiddleware, async (req, res) => {
   try {
@@ -392,6 +420,7 @@ app.get("/api/users/profile", authMiddleware, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+
 app.put("/api/users/profile", authMiddleware, async (req, res) => {
   try {
     const { name, photoURL, bio, address } = req.body;
@@ -453,6 +482,113 @@ app.get("/api/users/won-contests", authMiddleware, async (req, res) => {
     res.json({ contests: contests.filter(Boolean) });
   } catch {
     res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get(
+  "/api/creator/all-submissions",
+  authMiddleware,
+  requireRole("creator"),
+  async (req, res) => {
+    try {
+      const contests = await Contests.find({
+        creator: new ObjectId(req.user._id),
+      })
+        .project({ _id: 1 })
+        .toArray();
+
+      const contestIds = contests.map((c) => c._id);
+
+      const submissions = await Submissions.aggregate([
+        { $match: { contest: { $in: contestIds } } },
+        {
+          $lookup: {
+            from: "users",
+            localField: "user",
+            foreignField: "_id",
+            as: "user",
+          },
+        },
+        { $unwind: "$user" },
+        {
+          $lookup: {
+            from: "contests",
+            localField: "contest",
+            foreignField: "_id",
+            as: "contest",
+          },
+        },
+        { $unwind: "$contest" },
+        {
+          $project: {
+            _id: 1,
+            filePath: 1,
+            submittedAt: 1,
+            isWinner: 1,
+            user: {
+              _id: "$user._id",
+              name: "$user.name",
+              email: "$user.email",
+              photoURL: "$user.photoURL",
+            },
+            contest: {
+              _id: "$contest._id",
+              name: "$contest.name",
+            },
+          },
+        },
+        { $sort: { submittedAt: -1 } },
+      ]).toArray();
+
+      res.json({ submissions });
+    } catch (err) {
+      console.error("❌ Creator submissions error:", err);
+      res.status(500).json({ error: "Failed to fetch submissions" });
+    }
+  }
+);
+
+app.get(
+  "/api/contests/creator/my-contests",
+  authMiddleware,
+  requireRole("creator"),
+  async (req, res) => {
+    try {
+      const contests = await Contests.find({
+        creator: new ObjectId(req.user._id),
+      })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      res.json({ contests });
+    } catch (err) {
+      console.error("❌ My contests error:", err);
+      res.status(500).json({ error: "Failed to fetch contests" });
+    }
+  }
+);
+
+app.get("/api/contests/:id/my-submission", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid contest ID" });
+    }
+
+    const submission = await Submissions.findOne({
+      contest: new ObjectId(id),
+      user: new ObjectId(req.user._id),
+    });
+
+    if (!submission) {
+      return res.status(404).json({ error: "No submission found" });
+    }
+
+    res.json({ submission });
+  } catch (error) {
+    console.error("❌ Error fetching user submission:", error);
+    res.status(500).json({ error: "Failed to fetch submission" });
   }
 });
 
@@ -551,7 +687,6 @@ app.patch("/api/payment-success", async (req, res) => {
         .json({ error: "Missing contestId or customer email in session" });
     }
 
-    // Find user
     let user = null;
     const metaUserId =
       session.metadata?.userId || session.metadata?.user_id || "";
@@ -749,12 +884,13 @@ app.post(
 // ==================== CREATOR REQUEST ROUTES ====================
 app.get("/api/creator-requests/my-status", authMiddleware, async (req, res) => {
   try {
-    const request = await db.collection("creator_requests").findOne(
-      {
-        userId: new ObjectId(req.user._id),
-      },
-      { sort: { createdAt: -1 } }
-    );
+    const { db } = await connectToDatabase();
+    const request = await db
+      .collection("creator_requests")
+      .findOne(
+        { userId: new ObjectId(req.user._id) },
+        { sort: { createdAt: -1 } }
+      );
     res.json({ request });
   } catch (error) {
     console.error("❌ Error fetching request status:", error);
@@ -767,6 +903,8 @@ app.post("/api/creator-requests", authMiddleware, async (req, res) => {
     if (req.user.role === "creator" || req.user.role === "admin") {
       return res.status(400).json({ error: "You are already a creator" });
     }
+
+    const { db } = await connectToDatabase(); // Add this
 
     const existingRequest = await db.collection("creator_requests").findOne({
       userId: new ObjectId(req.user._id),
@@ -806,6 +944,8 @@ app.get(
   requireRole("admin"),
   async (req, res) => {
     try {
+      const { db } = await connectToDatabase(); // Add this
+
       const requests = await db
         .collection("creator_requests")
         .find({})
@@ -835,6 +975,8 @@ app.put(
       if (!["approved", "rejected"].includes(status)) {
         return res.status(400).json({ error: "Invalid status" });
       }
+
+      const { db } = await connectToDatabase(); // Add this
 
       const request = await db
         .collection("creator_requests")
@@ -869,6 +1011,285 @@ app.put(
     }
   }
 );
+
+// ==================== Contests Related =========================
+app.get("/api/contests", async (req, res) => {
+  try {
+    const { page = 1, limit = 10, status, type, creator } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const filter = {};
+    if (status) filter.status = status;
+    if (type) filter.type = type;
+    if (creator && ObjectId.isValid(creator))
+      filter.creator = new ObjectId(creator);
+
+    const contests = await Contests.find(filter)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit))
+      .toArray();
+    const total = await Contests.countDocuments(filter);
+    res.json({
+      contests,
+      total,
+      page: parseInt(page),
+      pages: Math.ceil(total / parseInt(limit)),
+    });
+  } catch (error) {
+    console.error("❌ Error:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post(
+  "/api/contests",
+  authMiddleware,
+  requireRole("creator"),
+  async (req, res) => {
+    try {
+      const {
+        name,
+        description,
+        image,
+        type,
+        entryFee,
+        prizeMoney,
+        deadline,
+        taskInstruction,
+      } = req.body;
+
+      console.log("📍 Creating contest:", { name, type, prizeMoney });
+
+      // Validate required fields
+      if (
+        !name ||
+        !description ||
+        !image ||
+        !type ||
+        entryFee === undefined ||
+        prizeMoney === undefined ||
+        !deadline ||
+        !taskInstruction
+      ) {
+        console.log("❌ Missing fields");
+        return res.status(400).json({ error: "Missing required fields" });
+      }
+
+      const slug =
+        name
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "") +
+        "-" +
+        Date.now();
+
+      const creatorId =
+        req.user._id instanceof ObjectId
+          ? req.user._id
+          : new ObjectId(req.user._id);
+
+      const contest = {
+        name,
+        slug,
+        description,
+        image,
+        type: type,
+        contestType: type,
+        prizeMoney: Number(prizeMoney),
+        deadline: new Date(deadline),
+        entryFee: Number(entryFee),
+        participantsLimit: null,
+        tags: [],
+        taskInstruction,
+        creator: creatorId,
+        creatorName: req.user.name,
+        creatorEmail: req.user.email,
+        status: "pending",
+        participantsCount: 0,
+        submissionsCount: 0,
+        winner: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const result = await Contests.insertOne(contest);
+      const createdContest = await Contests.findOne({ _id: result.insertedId });
+
+      console.log("✅ Contest created:", createdContest._id);
+
+      res.status(201).json({
+        success: true,
+        contest: createdContest,
+      });
+    } catch (err) {
+      console.error("❌ Contest creation error:", err);
+      res.status(500).json({
+        error: err.message,
+        details: "Failed to create contest",
+      });
+    }
+  }
+);
+
+app.get("/api/contests/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    console.log("📍 Fetching contest with ID:", id);
+
+    if (!ObjectId.isValid(id)) {
+      console.log("❌ Invalid ObjectId format");
+      return res.status(400).json({ error: "Invalid contest ID" });
+    }
+
+    const contest = await Contests.findOne({ _id: new ObjectId(id) });
+
+    if (!contest) {
+      console.log("❌ Contest not found");
+      return res.status(404).json({ error: "Contest not found" });
+    }
+
+    console.log("✅ Contest found:", contest.name);
+    res.json({ contest });
+  } catch (error) {
+    console.error("❌ Error fetching contest:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Update contest
+app.put("/api/contests/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid contest ID" });
+    }
+
+    const contest = await Contests.findOne({ _id: new ObjectId(id) });
+
+    if (!contest) {
+      return res.status(404).json({ error: "Contest not found" });
+    }
+
+    if (
+      req.user.role !== "admin" &&
+      contest.creator.toString() !== req.user._id.toString()
+    ) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const {
+      name,
+      description,
+      image,
+      type,
+      prizeMoney,
+      deadline,
+      entryFee,
+      participantsLimit,
+      tags,
+      taskInstruction,
+    } = req.body;
+
+    const updates = {};
+    if (name) updates.name = name;
+    if (description) updates.description = description;
+    if (image) updates.image = image;
+    if (type) {
+      updates.type = type;
+      updates.contestType = type;
+    }
+    if (prizeMoney !== undefined) updates.prizeMoney = Number(prizeMoney);
+    if (deadline) updates.deadline = new Date(deadline);
+    if (entryFee !== undefined) updates.entryFee = Number(entryFee);
+    if (participantsLimit !== undefined) {
+      updates.participantsLimit = participantsLimit
+        ? Number(participantsLimit)
+        : null;
+    }
+    if (tags) updates.tags = Array.isArray(tags) ? tags : [];
+    if (taskInstruction !== undefined)
+      updates.taskInstruction = taskInstruction;
+    updates.updatedAt = new Date();
+
+    await Contests.updateOne({ _id: new ObjectId(id) }, { $set: updates });
+
+    const updatedContest = await Contests.findOne({ _id: new ObjectId(id) });
+    res.json({ success: true, contest: updatedContest });
+  } catch (error) {
+    console.error("❌ Error updating contest:", error);
+    res.status(500).json({ error: "Failed to update contest" });
+  }
+});
+
+// Delete contest
+app.delete("/api/contests/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    console.log("📍 DELETE request for contest ID:", id);
+
+    if (!ObjectId.isValid(id)) {
+      console.log("❌ Invalid ObjectId format");
+      return res.status(400).json({ error: "Invalid contest ID" });
+    }
+
+    const contest = await Contests.findOne({ _id: new ObjectId(id) });
+
+    if (!contest) {
+      console.log("❌ Contest not found");
+      return res.status(404).json({ error: "Contest not found" });
+    }
+
+    if (
+      req.user.role !== "admin" &&
+      contest.creator.toString() !== req.user._id.toString()
+    ) {
+      console.log("❌ Unauthorized delete attempt");
+      return res
+        .status(403)
+        .json({ error: "Forbidden - You can only delete your own contests" });
+    }
+
+    if (contest.status !== "pending" && req.user.role !== "admin") {
+      return res.status(400).json({
+        error: "Cannot delete confirmed or rejected contests",
+      });
+    }
+
+    console.log("✅ Deleting contest:", contest.name);
+
+    await Registrations.deleteMany({ contest: new ObjectId(id) });
+
+    const submissions = await Submissions.find({
+      contest: new ObjectId(id),
+    }).toArray();
+    for (const submission of submissions) {
+      if (submission.filePath && bucket) {
+        try {
+          await bucket.file(submission.filePath).delete();
+          console.log("🗑️ Deleted storage file:", submission.filePath);
+        } catch (err) {
+          console.warn(
+            "⚠️ Error deleting storage file:",
+            submission.filePath,
+            err.message
+          );
+        }
+      }
+    }
+    await Submissions.deleteMany({ contest: new ObjectId(id) });
+
+    await Contests.deleteOne({ _id: new ObjectId(id) });
+
+    console.log("✅ Contest deleted successfully");
+    res.json({ success: true, message: "Contest deleted successfully" });
+  } catch (error) {
+    console.error("❌ Error deleting contest:", error);
+    res.status(500).json({ error: "Failed to delete contest" });
+  }
+});
 
 // ==================== WINNERS & LEADERBOARD ====================
 app.get("/api/winners", async (req, res) => {
@@ -1023,34 +1444,6 @@ app.get(
     res.json({ contests });
   }
 );
-
-app.get("/api/contests", async (req, res) => {
-  try {
-    const { page = 1, limit = 10, status, type, creator } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const filter = {};
-    if (status) filter.status = status;
-    if (type) filter.type = type;
-    if (creator && ObjectId.isValid(creator))
-      filter.creator = new ObjectId(creator);
-
-    const contests = await Contests.find(filter)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(parseInt(limit))
-      .toArray();
-    const total = await Contests.countDocuments(filter);
-    res.json({
-      contests,
-      total,
-      page: parseInt(page),
-      pages: Math.ceil(total / parseInt(limit)),
-    });
-  } catch (error) {
-    console.error("❌ Error:", error);
-    res.status(500).json({ error: "Server error" });
-  }
-});
 
 // ==================== STATS ROUTE ====================
 app.get("/api/stats", authMiddleware, async (req, res) => {
